@@ -75,15 +75,17 @@ public class DuckLakeMetadataBackend implements AutoCloseable {
     /** Get snapshot by version (snapshot_id). Returns null if not found. */
     public SnapshotInfo getSnapshotAtVersion(long version) throws SQLException {
         try (PreparedStatement ps = getConnection().prepareStatement(
-                "SELECT snapshot_id, snapshot_time, snapshot_changes " +
-                "FROM ducklake_snapshot WHERE snapshot_id = ?")) {
+                "SELECT s.snapshot_id, s.snapshot_time, c.changes_made " +
+                "FROM ducklake_snapshot s " +
+                "LEFT JOIN ducklake_snapshot_changes c ON s.snapshot_id = c.snapshot_id " +
+                "WHERE s.snapshot_id = ?")) {
             ps.setLong(1, version);
             try (ResultSet rs = ps.executeQuery()) {
                 if (rs.next()) {
                     return new SnapshotInfo(
                             rs.getLong("snapshot_id"),
                             rs.getString("snapshot_time"),
-                            rs.getString("snapshot_changes"));
+                            rs.getString("changes_made"));
                 }
             }
         }
@@ -93,16 +95,17 @@ public class DuckLakeMetadataBackend implements AutoCloseable {
     /** Get the latest snapshot at or before the given timestamp. Returns null if none found. */
     public SnapshotInfo getSnapshotAtTime(String timestamp) throws SQLException {
         try (PreparedStatement ps = getConnection().prepareStatement(
-                "SELECT snapshot_id, snapshot_time, snapshot_changes " +
-                "FROM ducklake_snapshot " +
-                "WHERE snapshot_time <= ? ORDER BY snapshot_id DESC LIMIT 1")) {
+                "SELECT s.snapshot_id, s.snapshot_time, c.changes_made " +
+                "FROM ducklake_snapshot s " +
+                "LEFT JOIN ducklake_snapshot_changes c ON s.snapshot_id = c.snapshot_id " +
+                "WHERE s.snapshot_time <= ? ORDER BY s.snapshot_id DESC LIMIT 1")) {
             ps.setString(1, timestamp);
             try (ResultSet rs = ps.executeQuery()) {
                 if (rs.next()) {
                     return new SnapshotInfo(
                             rs.getLong("snapshot_id"),
                             rs.getString("snapshot_time"),
-                            rs.getString("snapshot_changes"));
+                            rs.getString("changes_made"));
                 }
             }
         }
@@ -114,13 +117,15 @@ public class DuckLakeMetadataBackend implements AutoCloseable {
         List<SnapshotInfo> result = new ArrayList<>();
         try (Statement s = getConnection().createStatement();
              ResultSet rs = s.executeQuery(
-                     "SELECT snapshot_id, snapshot_time, snapshot_changes " +
-                     "FROM ducklake_snapshot ORDER BY snapshot_id")) {
+                     "SELECT s.snapshot_id, s.snapshot_time, c.changes_made " +
+                     "FROM ducklake_snapshot s " +
+                     "LEFT JOIN ducklake_snapshot_changes c ON s.snapshot_id = c.snapshot_id " +
+                     "ORDER BY s.snapshot_id")) {
             while (rs.next()) {
                 result.add(new SnapshotInfo(
                         rs.getLong("snapshot_id"),
                         rs.getString("snapshot_time"),
-                        rs.getString("snapshot_changes")));
+                        rs.getString("changes_made")));
             }
         }
         return result;
@@ -688,6 +693,91 @@ public class DuckLakeMetadataBackend implements AutoCloseable {
         }
     }
 
+    // ---------------------------------------------------------------
+    // Maintenance operations
+    // ---------------------------------------------------------------
+
+    /** Delete a snapshot record and its associated changes record. */
+    public void deleteSnapshotRecord(long snapshotId) throws SQLException {
+        try (PreparedStatement ps = getConnection().prepareStatement(
+                "DELETE FROM ducklake_snapshot_changes WHERE snapshot_id = ?")) {
+            ps.setLong(1, snapshotId);
+            ps.executeUpdate();
+        }
+        try (PreparedStatement ps = getConnection().prepareStatement(
+                "DELETE FROM ducklake_snapshot WHERE snapshot_id = ?")) {
+            ps.setLong(1, snapshotId);
+            ps.executeUpdate();
+        }
+    }
+
+    /** Get all data files that have been logically deleted (end_snapshot IS NOT NULL). */
+    public List<EndedFileInfo> getEndedDataFiles() throws SQLException {
+        List<EndedFileInfo> result = new ArrayList<>();
+        try (Statement s = getConnection().createStatement();
+             ResultSet rs = s.executeQuery(
+                     "SELECT data_file_id, table_id, begin_snapshot, end_snapshot, path, path_is_relative " +
+                     "FROM ducklake_data_file WHERE end_snapshot IS NOT NULL")) {
+            while (rs.next()) {
+                result.add(new EndedFileInfo(
+                        rs.getLong("data_file_id"),
+                        rs.getLong("table_id"),
+                        rs.getLong("begin_snapshot"),
+                        rs.getLong("end_snapshot"),
+                        rs.getString("path"),
+                        rs.getInt("path_is_relative") == 1));
+            }
+        }
+        return result;
+    }
+
+    /** Get all delete files that have been logically deleted (end_snapshot IS NOT NULL). */
+    public List<EndedFileInfo> getEndedDeleteFiles() throws SQLException {
+        List<EndedFileInfo> result = new ArrayList<>();
+        try (Statement s = getConnection().createStatement();
+             ResultSet rs = s.executeQuery(
+                     "SELECT delete_file_id, table_id, begin_snapshot, end_snapshot, path, path_is_relative " +
+                     "FROM ducklake_delete_file WHERE end_snapshot IS NOT NULL")) {
+            while (rs.next()) {
+                result.add(new EndedFileInfo(
+                        rs.getLong("delete_file_id"),
+                        rs.getLong("table_id"),
+                        rs.getLong("begin_snapshot"),
+                        rs.getLong("end_snapshot"),
+                        rs.getString("path"),
+                        rs.getInt("path_is_relative") == 1));
+            }
+        }
+        return result;
+    }
+
+    /** Physically remove a data file record from the catalog. */
+    public void removeDataFileRecord(long dataFileId) throws SQLException {
+        try (PreparedStatement ps = getConnection().prepareStatement(
+                "DELETE FROM ducklake_data_file WHERE data_file_id = ?")) {
+            ps.setLong(1, dataFileId);
+            ps.executeUpdate();
+        }
+    }
+
+    /** Physically remove a delete file record from the catalog. */
+    public void removeDeleteFileRecord(long deleteFileId) throws SQLException {
+        try (PreparedStatement ps = getConnection().prepareStatement(
+                "DELETE FROM ducklake_delete_file WHERE delete_file_id = ?")) {
+            ps.setLong(1, deleteFileId);
+            ps.executeUpdate();
+        }
+    }
+
+    /** Remove column statistics for a specific data file. */
+    public void removeColumnStatsForFile(long dataFileId, long tableId) throws SQLException {
+        try (PreparedStatement ps = getConnection().prepareStatement(
+                "DELETE FROM ducklake_file_column_stats WHERE data_file_id = ? AND table_id = ?")) {
+            ps.setLong(1, dataFileId);
+            ps.setLong(2, tableId);
+            ps.executeUpdate();
+        }
+    }
 
     // ---------------------------------------------------------------
     // DDL operations (catalog plugin)
@@ -1049,6 +1139,25 @@ public class DuckLakeMetadataBackend implements AutoCloseable {
             this.recordCount = recordCount;
             this.nextRowId = nextRowId;
             this.fileSizeBytes = fileSizeBytes;
+        }
+    }
+
+    public static class EndedFileInfo {
+        public final long fileId;
+        public final long tableId;
+        public final long beginSnapshot;
+        public final long endSnapshot;
+        public final String path;
+        public final boolean pathIsRelative;
+
+        public EndedFileInfo(long fileId, long tableId, long beginSnapshot, long endSnapshot,
+                             String path, boolean pathIsRelative) {
+            this.fileId = fileId;
+            this.tableId = tableId;
+            this.beginSnapshot = beginSnapshot;
+            this.endSnapshot = endSnapshot;
+            this.path = path;
+            this.pathIsRelative = pathIsRelative;
         }
     }
 }

@@ -46,7 +46,10 @@ public class DuckLakeTimeTravelTest {
                 s.execute("CREATE TABLE ducklake_snapshot ("
                         + "snapshot_id INTEGER PRIMARY KEY, "
                         + "snapshot_time TEXT, "
-                        + "snapshot_changes TEXT)");
+                        + "schema_version BIGINT, next_catalog_id BIGINT, next_file_id BIGINT)");
+                s.execute("CREATE TABLE ducklake_snapshot_changes ("
+                        + "snapshot_id BIGINT PRIMARY KEY, changes_made VARCHAR, "
+                        + "author VARCHAR, commit_message VARCHAR, commit_extra_info VARCHAR)");
                 s.execute("CREATE TABLE ducklake_schema ("
                         + "schema_id INTEGER PRIMARY KEY, "
                         + "schema_name TEXT, path TEXT, path_is_relative INTEGER, "
@@ -79,9 +82,12 @@ public class DuckLakeTimeTravelTest {
                 s.execute("INSERT INTO ducklake_metadata VALUES ('data_path', '/tmp/ducklake_data/', NULL)");
 
                 // --- 3 snapshots ---
-                s.execute("INSERT INTO ducklake_snapshot VALUES (1, '2026-01-01T00:00:00', 'create table')");
-                s.execute("INSERT INTO ducklake_snapshot VALUES (2, '2026-01-02T00:00:00', 'insert batch 2')");
-                s.execute("INSERT INTO ducklake_snapshot VALUES (3, '2026-01-03T00:00:00', 'insert batch 3')");
+                s.execute("INSERT INTO ducklake_snapshot VALUES (1, '2026-01-01T00:00:00', 0, 100, 100)");
+                s.execute("INSERT INTO ducklake_snapshot VALUES (2, '2026-01-02T00:00:00', 0, 100, 100)");
+                s.execute("INSERT INTO ducklake_snapshot VALUES (3, '2026-01-03T00:00:00', 0, 100, 100)");
+                s.execute("INSERT INTO ducklake_snapshot_changes VALUES (1, 'create table', NULL, NULL, NULL)");
+                s.execute("INSERT INTO ducklake_snapshot_changes VALUES (2, 'insert batch 2', NULL, NULL, NULL)");
+                s.execute("INSERT INTO ducklake_snapshot_changes VALUES (3, 'insert batch 3', NULL, NULL, NULL)");
 
                 // --- Schema (visible from snapshot 1) ---
                 s.execute("INSERT INTO ducklake_schema VALUES (1, 'main', NULL, 0, 1, NULL)");
