@@ -71,7 +71,7 @@ public class DuckLakeBatchWrite implements Write, BatchWrite {
             backend.beginTransaction();
             try {
                 long currentSnap = backend.getCurrentSnapshotId();
-                SnapshotInfo snapInfo = backend.getSnapshotInfo(currentSnap);
+                CatalogState snapInfo = backend.getSnapshotInfo(currentSnap);
 
                 long newSnap = currentSnap + 1;
                 long nextFileId = snapInfo.nextFileId;

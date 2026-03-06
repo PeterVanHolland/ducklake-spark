@@ -518,13 +518,13 @@ public class DuckLakeMetadataBackend implements AutoCloseable {
     }
 
     /** Get snapshot metadata. */
-    public SnapshotInfo getSnapshotInfo(long snapshotId) throws SQLException {
+    public CatalogState getSnapshotInfo(long snapshotId) throws SQLException {
         try (PreparedStatement ps = getConnection().prepareStatement(
                 "SELECT schema_version, next_catalog_id, next_file_id FROM ducklake_snapshot WHERE snapshot_id = ?")) {
             ps.setLong(1, snapshotId);
             try (ResultSet rs = ps.executeQuery()) {
                 if (rs.next()) {
-                    return new SnapshotInfo(
+                    return new CatalogState(
                             rs.getLong("schema_version"),
                             rs.getLong("next_catalog_id"),
                             rs.getLong("next_file_id"));
@@ -786,12 +786,12 @@ public class DuckLakeMetadataBackend implements AutoCloseable {
         }
     }
 
-    public static class SnapshotInfo {
+    public static class CatalogState {
         public final long schemaVersion;
         public final long nextCatalogId;
         public final long nextFileId;
 
-        public SnapshotInfo(long schemaVersion, long nextCatalogId, long nextFileId) {
+        public CatalogState(long schemaVersion, long nextCatalogId, long nextFileId) {
             this.schemaVersion = schemaVersion;
             this.nextCatalogId = nextCatalogId;
             this.nextFileId = nextFileId;
