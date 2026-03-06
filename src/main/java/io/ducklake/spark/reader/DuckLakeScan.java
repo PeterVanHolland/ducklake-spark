@@ -8,6 +8,7 @@ import org.apache.spark.sql.types.StructType;
 import org.apache.spark.sql.util.CaseInsensitiveStringMap;
 import org.apache.spark.sql.sources.Filter;
 
+import java.io.Serializable;
 import java.sql.SQLException;
 import java.util.*;
 
@@ -16,6 +17,8 @@ import java.util.*;
  * (one per data file) and handles file pruning via column statistics.
  *
  * Supports time travel via snapshot_version / snapshot_time options.
+ * Supports schema evolution: maps columns by field_id and fills
+ * defaults for columns added after a file was written.
  */
 public class DuckLakeScan implements Scan, Batch {
 
@@ -66,6 +69,18 @@ public class DuckLakeScan implements Scan, Batch {
             Map<Long, String> colIdToName = new HashMap<>();
             for (ColumnInfo col : columns) {
                 colIdToName.put(col.columnId, col.name);
+            }
+
+            // Build schema evolution maps from current columns
+            Map<String, Long> nameToColumnId = new HashMap<>();
+            Map<Long, String> columnDefaults = new HashMap<>();
+            Map<Long, String> columnTypes = new HashMap<>();
+            for (ColumnInfo col : columns) {
+                nameToColumnId.put(col.name, col.columnId);
+                if (col.initialDefault != null) {
+                    columnDefaults.put(col.columnId, col.initialDefault);
+                }
+                columnTypes.put(col.columnId, col.type);
             }
 
             List<InputPartition> partitions = new ArrayList<>();
@@ -120,7 +135,10 @@ public class DuckLakeScan implements Scan, Batch {
                         file.recordCount,
                         deletePaths.toArray(new String[0]),
                         nameMapping,
-                        colIdToName));
+                        colIdToName,
+                        nameToColumnId,
+                        columnDefaults,
+                        columnTypes));
             }
 
             return partitions.toArray(new InputPartition[0]);
