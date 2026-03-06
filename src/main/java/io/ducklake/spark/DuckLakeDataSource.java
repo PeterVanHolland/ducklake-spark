@@ -1,12 +1,15 @@
 package io.ducklake.spark;
 
 import io.ducklake.spark.reader.DuckLakeScanBuilder;
+import io.ducklake.spark.writer.DuckLakeWriteBuilder;
 import io.ducklake.spark.catalog.DuckLakeMetadataBackend;
 import io.ducklake.spark.util.DuckLakeTypeMapping;
 
 import org.apache.spark.sql.connector.catalog.*;
 import org.apache.spark.sql.connector.expressions.Transform;
 import org.apache.spark.sql.connector.read.ScanBuilder;
+import org.apache.spark.sql.connector.write.LogicalWriteInfo;
+import org.apache.spark.sql.connector.write.WriteBuilder;
 import org.apache.spark.sql.types.StructType;
 import org.apache.spark.sql.util.CaseInsensitiveStringMap;
 
@@ -27,6 +30,7 @@ import java.util.*;
  *   .option("snapshot_time", "2026-01-01T00:00:00")  // read at timestamp
  */
 public class DuckLakeDataSource implements TableProvider {
+
 
     @Override
     public StructType inferSchema(CaseInsensitiveStringMap options) {
@@ -83,7 +87,7 @@ public class DuckLakeDataSource implements TableProvider {
     // Inner Table class implementing SupportsRead
     // ---------------------------------------------------------------
 
-    static class DuckLakeTable implements Table, SupportsRead {
+    static class DuckLakeTable implements Table, SupportsRead, SupportsWrite {
         private final StructType schema;
         private final CaseInsensitiveStringMap options;
 
@@ -105,7 +109,9 @@ public class DuckLakeDataSource implements TableProvider {
         @Override
         public Set<TableCapability> capabilities() {
             return new HashSet<>(Arrays.asList(
-                    TableCapability.BATCH_READ
+                    TableCapability.BATCH_READ,
+                    TableCapability.BATCH_WRITE,
+                    TableCapability.TRUNCATE
             ));
         }
 
@@ -115,6 +121,13 @@ public class DuckLakeDataSource implements TableProvider {
             Map<String, String> merged = new HashMap<>(this.options.asCaseSensitiveMap());
             merged.putAll(options.asCaseSensitiveMap());
             return new DuckLakeScanBuilder(schema, new CaseInsensitiveStringMap(merged));
+        }
+
+        @Override
+        public WriteBuilder newWriteBuilder(LogicalWriteInfo info) {
+            Map<String, String> merged = new HashMap<>(this.options.asCaseSensitiveMap());
+            merged.putAll(info.options().asCaseSensitiveMap());
+            return new DuckLakeWriteBuilder(info.schema(), new CaseInsensitiveStringMap(merged));
         }
     }
 }
