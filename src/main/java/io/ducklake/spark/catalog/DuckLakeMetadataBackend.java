@@ -390,6 +390,171 @@ public class DuckLakeMetadataBackend implements AutoCloseable {
     }
 
     // ---------------------------------------------------------------
+    // Write operations
+    // ---------------------------------------------------------------
+
+    /** Begin a transaction on the underlying connection. */
+    public void beginTransaction() throws SQLException {
+        getConnection().setAutoCommit(false);
+    }
+
+    /** Commit the current transaction. */
+    public void commitTransaction() throws SQLException {
+        getConnection().commit();
+        getConnection().setAutoCommit(true);
+    }
+
+    /** Rollback the current transaction. */
+    public void rollbackTransaction() throws SQLException {
+        try {
+            getConnection().rollback();
+        } finally {
+            getConnection().setAutoCommit(true);
+        }
+    }
+
+    /** Get snapshot metadata. */
+    public SnapshotInfo getSnapshotInfo(long snapshotId) throws SQLException {
+        try (PreparedStatement ps = getConnection().prepareStatement(
+                "SELECT schema_version, next_catalog_id, next_file_id FROM ducklake_snapshot WHERE snapshot_id = ?")) {
+            ps.setLong(1, snapshotId);
+            try (ResultSet rs = ps.executeQuery()) {
+                if (rs.next()) {
+                    return new SnapshotInfo(
+                            rs.getLong("schema_version"),
+                            rs.getLong("next_catalog_id"),
+                            rs.getLong("next_file_id"));
+                }
+            }
+        }
+        throw new SQLException("Snapshot not found: " + snapshotId);
+    }
+
+    /** Get table-level statistics. */
+    public TableStats getTableStats(long tableId) throws SQLException {
+        try (PreparedStatement ps = getConnection().prepareStatement(
+                "SELECT record_count, next_row_id, file_size_bytes FROM ducklake_table_stats WHERE table_id = ?")) {
+            ps.setLong(1, tableId);
+            try (ResultSet rs = ps.executeQuery()) {
+                if (rs.next()) {
+                    return new TableStats(
+                            rs.getLong("record_count"),
+                            rs.getLong("next_row_id"),
+                            rs.getLong("file_size_bytes"));
+                }
+            }
+        }
+        return new TableStats(0, 0, 0);
+    }
+
+    /** Check if a table has any active data files. */
+    public boolean hasDataFiles(long tableId) throws SQLException {
+        long snap = getCurrentSnapshotId();
+        try (PreparedStatement ps = getConnection().prepareStatement(
+                "SELECT 1 FROM ducklake_data_file WHERE table_id = ? " +
+                "AND begin_snapshot <= ? AND (end_snapshot IS NULL OR end_snapshot > ?) LIMIT 1")) {
+            ps.setLong(1, tableId);
+            ps.setLong(2, snap);
+            ps.setLong(3, snap);
+            try (ResultSet rs = ps.executeQuery()) {
+                return rs.next();
+            }
+        }
+    }
+
+    /** Create a new snapshot record. */
+    public void createSnapshot(long snapshotId, long schemaVersion, long nextCatalogId, long nextFileId) throws SQLException {
+        try (PreparedStatement ps = getConnection().prepareStatement(
+                "INSERT INTO ducklake_snapshot (snapshot_id, snapshot_time, schema_version, next_catalog_id, next_file_id) VALUES (?, datetime('now'), ?, ?, ?)")) {
+            ps.setLong(1, snapshotId);
+            ps.setLong(2, schemaVersion);
+            ps.setLong(3, nextCatalogId);
+            ps.setLong(4, nextFileId);
+            ps.executeUpdate();
+        }
+    }
+
+    /** Insert a snapshot changes record. */
+    public void insertSnapshotChanges(long snapshotId, String changesMade, String author, String commitMessage) throws SQLException {
+        try (PreparedStatement ps = getConnection().prepareStatement(
+                "INSERT INTO ducklake_snapshot_changes (snapshot_id, changes_made, author, commit_message) VALUES (?, ?, ?, ?)")) {
+            ps.setLong(1, snapshotId);
+            ps.setString(2, changesMade);
+            ps.setString(3, author);
+            ps.setString(4, commitMessage);
+            ps.executeUpdate();
+        }
+    }
+
+    /** Insert a data file record. */
+    public void insertDataFile(long dataFileId, long tableId, long beginSnapshot, long fileOrder,
+                               String path, long recordCount, long fileSizeBytes, long rowIdStart) throws SQLException {
+        try (PreparedStatement ps = getConnection().prepareStatement(
+                "INSERT INTO ducklake_data_file (data_file_id, table_id, begin_snapshot, end_snapshot, file_order, path, path_is_relative, " +
+                "file_format, record_count, file_size_bytes, footer_size, row_id_start, partition_id, encryption_key, mapping_id, partial_max) " +
+                "VALUES (?, ?, ?, NULL, ?, ?, 1, 'PARQUET', ?, ?, 0, ?, NULL, NULL, NULL, NULL)")) {
+            ps.setLong(1, dataFileId);
+            ps.setLong(2, tableId);
+            ps.setLong(3, beginSnapshot);
+            ps.setLong(4, fileOrder);
+            ps.setString(5, path);
+            ps.setLong(6, recordCount);
+            ps.setLong(7, fileSizeBytes);
+            ps.setLong(8, rowIdStart);
+            ps.executeUpdate();
+        }
+    }
+
+    /** Insert column statistics for a data file. */
+    public void insertColumnStats(long dataFileId, long tableId, long columnId,
+                                  long valueCount, long nullCount, String minValue, String maxValue) throws SQLException {
+        try (PreparedStatement ps = getConnection().prepareStatement(
+                "INSERT INTO ducklake_file_column_stats (data_file_id, table_id, column_id, column_size_bytes, value_count, null_count, " +
+                "min_value, max_value, contains_nan, extra_stats) VALUES (?, ?, ?, NULL, ?, ?, ?, ?, NULL, NULL)")) {
+            ps.setLong(1, dataFileId);
+            ps.setLong(2, tableId);
+            ps.setLong(3, columnId);
+            ps.setLong(4, valueCount);
+            ps.setLong(5, nullCount);
+            if (minValue != null) { ps.setString(6, minValue); } else { ps.setNull(6, java.sql.Types.VARCHAR); }
+            if (maxValue != null) { ps.setString(7, maxValue); } else { ps.setNull(7, java.sql.Types.VARCHAR); }
+            ps.executeUpdate();
+        }
+    }
+
+    /** Upsert table-level statistics. */
+    public void updateTableStats(long tableId, long recordCount, long nextRowId, long fileSizeBytes) throws SQLException {
+        try (PreparedStatement ps = getConnection().prepareStatement(
+                "UPDATE ducklake_table_stats SET record_count = ?, next_row_id = ?, file_size_bytes = ? WHERE table_id = ?")) {
+            ps.setLong(1, recordCount);
+            ps.setLong(2, nextRowId);
+            ps.setLong(3, fileSizeBytes);
+            ps.setLong(4, tableId);
+            int updated = ps.executeUpdate();
+            if (updated == 0) {
+                try (PreparedStatement insert = getConnection().prepareStatement(
+                        "INSERT INTO ducklake_table_stats (table_id, record_count, next_row_id, file_size_bytes) VALUES (?, ?, ?, ?)")) {
+                    insert.setLong(1, tableId);
+                    insert.setLong(2, recordCount);
+                    insert.setLong(3, nextRowId);
+                    insert.setLong(4, fileSizeBytes);
+                    insert.executeUpdate();
+                }
+            }
+        }
+    }
+
+    /** Mark all active data files for a table as deleted at the given snapshot. */
+    public void markDataFilesDeleted(long tableId, long snapshotId) throws SQLException {
+        try (PreparedStatement ps = getConnection().prepareStatement(
+                "UPDATE ducklake_data_file SET end_snapshot = ? WHERE table_id = ? AND end_snapshot IS NULL")) {
+            ps.setLong(1, snapshotId);
+            ps.setLong(2, tableId);
+            ps.executeUpdate();
+        }
+    }
+
+    // ---------------------------------------------------------------
     // Data classes
     // ---------------------------------------------------------------
 
@@ -502,6 +667,30 @@ public class DuckLakeMetadataBackend implements AutoCloseable {
             this.maxValue = maxValue;
             this.nullCount = nullCount;
             this.valueCount = valueCount;
+        }
+    }
+
+    public static class SnapshotInfo {
+        public final long schemaVersion;
+        public final long nextCatalogId;
+        public final long nextFileId;
+
+        public SnapshotInfo(long schemaVersion, long nextCatalogId, long nextFileId) {
+            this.schemaVersion = schemaVersion;
+            this.nextCatalogId = nextCatalogId;
+            this.nextFileId = nextFileId;
+        }
+    }
+
+    public static class TableStats {
+        public final long recordCount;
+        public final long nextRowId;
+        public final long fileSizeBytes;
+
+        public TableStats(long recordCount, long nextRowId, long fileSizeBytes) {
+            this.recordCount = recordCount;
+            this.nextRowId = nextRowId;
+            this.fileSizeBytes = fileSizeBytes;
         }
     }
 }
