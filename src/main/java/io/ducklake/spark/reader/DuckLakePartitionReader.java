@@ -265,6 +265,30 @@ public class DuckLakePartitionReader implements PartitionReader<InternalRow> {
             return UTF8String.fromString(group.getString(fieldIndex, 0));
         } else if (sparkType instanceof BinaryType) {
             return group.getBinary(fieldIndex, 0).getBytes();
+        } else if (sparkType instanceof DateType) {
+            return group.getInteger(fieldIndex, 0);
+        } else if (sparkType instanceof TimestampType) {
+            return group.getLong(fieldIndex, 0);
+        } else if (sparkType instanceof DecimalType) {
+            DecimalType dt = (DecimalType) sparkType;
+            if (dt.precision() <= 9) {
+                long unscaled = group.getInteger(fieldIndex, 0);
+                org.apache.spark.sql.types.Decimal d = new org.apache.spark.sql.types.Decimal();
+                d.set(unscaled, dt.precision(), dt.scale());
+                return d;
+            } else if (dt.precision() <= 18) {
+                long unscaled = group.getLong(fieldIndex, 0);
+                org.apache.spark.sql.types.Decimal d = new org.apache.spark.sql.types.Decimal();
+                d.set(unscaled, dt.precision(), dt.scale());
+                return d;
+            } else {
+                byte[] bytes = group.getBinary(fieldIndex, 0).getBytes();
+                java.math.BigInteger bi = new java.math.BigInteger(bytes);
+                java.math.BigDecimal bd = new java.math.BigDecimal(bi, dt.scale());
+                org.apache.spark.sql.types.Decimal d = new org.apache.spark.sql.types.Decimal();
+                d.set(new scala.math.BigDecimal(bd), dt.precision(), dt.scale());
+                return d;
+            }
         } else {
             return UTF8String.fromString(group.getValueToString(fieldIndex, 0));
         }

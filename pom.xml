@@ -89,6 +89,14 @@
             <version>4.13.2</version>
             <scope>test</scope>
         </dependency>
+
+        <!-- DuckDB JDBC (cross-framework integration tests) -->
+        <dependency>
+            <groupId>org.duckdb</groupId>
+            <artifactId>duckdb_jdbc</artifactId>
+            <version>1.4.4.0</version>
+            <scope>test</scope>
+        </dependency>
     </dependencies>
 
     <build>
