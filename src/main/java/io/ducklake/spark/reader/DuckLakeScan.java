@@ -87,7 +87,33 @@ public class DuckLakeScan implements Scan, Batch {
                     nameMapping = backend.getNameMapping(file.mappingId);
                 }
 
-                // TODO: stats-based file pruning using filters and FileColumnStats
+                // Stats-based file pruning: skip files whose column stats
+                // prove no row can match the pushed filters
+                if (filters != null && filters.length > 0) {
+                    List<FileColumnStats> fileStats = backend.getFileColumnStats(
+                            table.tableId, file.dataFileId);
+                    if (!fileStats.isEmpty()) {
+                        Map<String, FileColumnStats> statsMap = new HashMap<>();
+                        for (FileColumnStats fs : fileStats) {
+                            String colName = colIdToName.get(fs.columnId);
+                            if (colName != null) {
+                                statsMap.put(colName, fs);
+                            }
+                        }
+                        DuckLakeFilterEvaluator evaluator =
+                                new DuckLakeFilterEvaluator(statsMap, file.recordCount);
+                        boolean skip = false;
+                        for (Filter f : filters) {
+                            if (!evaluator.mightMatch(f)) {
+                                skip = true;
+                                break;
+                            }
+                        }
+                        if (skip) {
+                            continue; // skip this data file
+                        }
+                    }
+                }
 
                 partitions.add(new DuckLakeInputPartition(
                         filePath,
