@@ -658,6 +658,36 @@ public class DuckLakeMetadataBackend implements AutoCloseable {
         }
     }
 
+    /** Insert a delete file record. */
+    public void insertDeleteFile(long deleteFileId, long tableId, long beginSnapshot,
+                                  long dataFileId, String path, long deleteCount,
+                                  long fileSizeBytes) throws SQLException {
+        try (PreparedStatement ps = getConnection().prepareStatement(
+                "INSERT INTO ducklake_delete_file (delete_file_id, table_id, begin_snapshot, end_snapshot, " +
+                "data_file_id, path, path_is_relative, format, delete_count, file_size_bytes, " +
+                "footer_size, encryption_key, partial_max) " +
+                "VALUES (?, ?, ?, NULL, ?, ?, 1, 'PARQUET', ?, ?, 0, NULL, NULL)")) {
+            ps.setLong(1, deleteFileId);
+            ps.setLong(2, tableId);
+            ps.setLong(3, beginSnapshot);
+            ps.setLong(4, dataFileId);
+            ps.setString(5, path);
+            ps.setLong(6, deleteCount);
+            ps.setLong(7, fileSizeBytes);
+            ps.executeUpdate();
+        }
+    }
+
+    /** Mark all active delete files for a table as deleted at the given snapshot. */
+    public void markDeleteFilesDeleted(long tableId, long snapshotId) throws SQLException {
+        try (PreparedStatement ps = getConnection().prepareStatement(
+                "UPDATE ducklake_delete_file SET end_snapshot = ? WHERE table_id = ? AND end_snapshot IS NULL")) {
+            ps.setLong(1, snapshotId);
+            ps.setLong(2, tableId);
+            ps.executeUpdate();
+        }
+    }
+
 
     // ---------------------------------------------------------------
     // DDL operations (catalog plugin)
@@ -860,6 +890,7 @@ public class DuckLakeMetadataBackend implements AutoCloseable {
             }
 
             markDataFilesDeleted(tableId, newSnap);
+            markDeleteFilesDeleted(tableId, newSnap);
 
             commitTransaction();
             return updated > 0;
