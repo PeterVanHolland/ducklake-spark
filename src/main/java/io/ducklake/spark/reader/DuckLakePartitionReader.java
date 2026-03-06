@@ -21,8 +21,13 @@ import java.io.IOException;
 import java.util.*;
 
 /**
- * Reads Parquet data files for a single DuckLake partition,
- * applying delete files and column rename mappings.
+ * Reads Parquet data files for a single DuckLake partition.
+ * Handles schema evolution by mapping columns via field_id (not name/position):
+ * <ul>
+ *   <li>Column renames: matched by field_id embedded in Parquet metadata</li>
+ *   <li>Added columns: filled with initialDefault from catalog</li>
+ *   <li>Dropped columns: ignored (only current schema columns are read)</li>
+ * </ul>
  */
 public class DuckLakePartitionReader implements PartitionReader<InternalRow> {
 
@@ -31,10 +36,15 @@ public class DuckLakePartitionReader implements PartitionReader<InternalRow> {
     private final StructType fullSchema;
 
     private ParquetFileReader fileReader;
+    private MessageType fileSchema;
     private long currentRowIndex = 0;
     private final Queue<InternalRow> rowBuffer = new LinkedList<>();
     private InternalRow currentRow;
     private final Set<Long> deletedRowIds;
+
+    // Schema evolution: per-output-column mappings (built once at init)
+    private int[] outputToFileIndex;    // requiredSchema col index -> file column index (-1 = not in file)
+    private Object[] defaultValues;     // requiredSchema col index -> default value for missing columns
 
     public DuckLakePartitionReader(DuckLakeInputPartition partition,
                                     StructType requiredSchema,
@@ -51,8 +61,74 @@ public class DuckLakePartitionReader implements PartitionReader<InternalRow> {
             Configuration conf = new Configuration();
             Path filePath = new Path(partition.getFilePath());
             fileReader = ParquetFileReader.open(conf, filePath);
+            fileSchema = fileReader.getFooter().getFileMetaData().getSchema();
+
+            buildColumnMapping();
         } catch (IOException e) {
             throw new RuntimeException("Failed to open Parquet file: " + partition.getFilePath(), e);
+        }
+    }
+
+    /**
+     * Build the mapping from output columns (requiredSchema) to file columns
+     * using field_id-based matching. Falls back to name-based matching when
+     * field_ids are not present in the Parquet file.
+     */
+    private void buildColumnMapping() {
+        int outputCount = requiredSchema.fields().length;
+        outputToFileIndex = new int[outputCount];
+        defaultValues = new Object[outputCount];
+
+        Map<String, Long> nameToColumnId = partition.getNameToColumnId();
+        Map<Long, String> columnDefaults = partition.getColumnDefaults();
+        Map<Long, String> nameMapping = partition.getNameMapping();
+
+        // Build field_id -> file column index from Parquet file schema
+        Map<Long, Integer> fileFieldIdToIndex = new HashMap<>();
+        Map<String, Integer> fileNameToIndex = new HashMap<>();
+        for (int i = 0; i < fileSchema.getFieldCount(); i++) {
+            org.apache.parquet.schema.Type fieldType = fileSchema.getType(i);
+            fileNameToIndex.put(fieldType.getName(), i);
+            if (fieldType.getId() != null) {
+                fileFieldIdToIndex.put((long) fieldType.getId().intValue(), i);
+            }
+        }
+
+        for (int i = 0; i < outputCount; i++) {
+            String colName = requiredSchema.fields()[i].name();
+            DataType sparkType = requiredSchema.fields()[i].dataType();
+            outputToFileIndex[i] = -1;  // default: not found in file
+
+            Long columnId = (nameToColumnId != null) ? nameToColumnId.get(colName) : null;
+
+            if (columnId != null) {
+                // Strategy 1: Match by field_id (handles renames correctly)
+                if (fileFieldIdToIndex.containsKey(columnId)) {
+                    outputToFileIndex[i] = fileFieldIdToIndex.get(columnId);
+                }
+                // Strategy 2: Fall back to name mapping (for files with mapping_id)
+                else if (nameMapping != null && nameMapping.containsKey(columnId)) {
+                    String physicalName = nameMapping.get(columnId);
+                    if (fileNameToIndex.containsKey(physicalName)) {
+                        outputToFileIndex[i] = fileNameToIndex.get(physicalName);
+                    }
+                }
+                // Strategy 3: Fall back to name-based match
+                else if (fileNameToIndex.containsKey(colName)) {
+                    outputToFileIndex[i] = fileNameToIndex.get(colName);
+                }
+
+                // If still not found, set the default value
+                if (outputToFileIndex[i] == -1) {
+                    String defaultStr = (columnDefaults != null) ? columnDefaults.get(columnId) : null;
+                    defaultValues[i] = parseDefault(defaultStr, sparkType);
+                }
+            } else {
+                // No column info -- try direct name match
+                if (fileNameToIndex.containsKey(colName)) {
+                    outputToFileIndex[i] = fileNameToIndex.get(colName);
+                }
+            }
         }
     }
 
@@ -70,14 +146,11 @@ public class DuckLakePartitionReader implements PartitionReader<InternalRow> {
             }
 
             long rowCount = pages.getRowCount();
-            MessageType fileSchema = fileReader.getFooter().getFileMetaData().getSchema();
 
             ColumnIOFactory factory = new ColumnIOFactory();
             MessageColumnIO columnIO = factory.getColumnIO(fileSchema);
             RecordReader<Group> recordReader =
                     columnIO.getRecordReader(pages, new GroupRecordConverter(fileSchema));
-
-            Map<String, String> physicalToLogical = buildPhysicalToLogicalMapping();
 
             for (long i = 0; i < rowCount; i++) {
                 Group group = recordReader.read();
@@ -87,7 +160,7 @@ public class DuckLakePartitionReader implements PartitionReader<InternalRow> {
                     continue;
                 }
 
-                InternalRow row = groupToInternalRow(group, fileSchema, physicalToLogical);
+                InternalRow row = groupToInternalRow(group);
                 rowBuffer.add(row);
             }
 
@@ -146,55 +219,28 @@ public class DuckLakePartitionReader implements PartitionReader<InternalRow> {
     }
 
     // ---------------------------------------------------------------
-    // Column rename mapping
+    // Parquet Group -> InternalRow (field_id-based mapping)
     // ---------------------------------------------------------------
 
-    private Map<String, String> buildPhysicalToLogicalMapping() {
-        Map<String, String> mapping = new HashMap<>();
-        Map<Long, String> nameMap = partition.getNameMapping();
-        Map<Long, String> colIdToName = partition.getColIdToName();
-
-        if (nameMap != null && colIdToName != null) {
-            for (Map.Entry<Long, String> entry : nameMap.entrySet()) {
-                long fieldId = entry.getKey();
-                String physicalName = entry.getValue();
-                String logicalName = colIdToName.get(fieldId);
-                if (logicalName != null && !physicalName.equals(logicalName)) {
-                    mapping.put(physicalName, logicalName);
-                }
-            }
-        }
-        return mapping;
-    }
-
-    // ---------------------------------------------------------------
-    // Parquet Group → InternalRow conversion
-    // ---------------------------------------------------------------
-
-    private InternalRow groupToInternalRow(Group group, MessageType fileSchema,
-                                            Map<String, String> physicalToLogical) {
+    private InternalRow groupToInternalRow(Group group) {
         Object[] values = new Object[requiredSchema.fields().length];
         for (int i = 0; i < requiredSchema.fields().length; i++) {
-            String sparkColName = requiredSchema.fields()[i].name();
+            int fileIndex = outputToFileIndex[i];
             DataType sparkType = requiredSchema.fields()[i].dataType();
 
-            String physicalName = sparkColName;
-            for (Map.Entry<String, String> entry : physicalToLogical.entrySet()) {
-                if (entry.getValue().equals(sparkColName)) {
-                    physicalName = entry.getKey();
-                    break;
-                }
-            }
-
-            try {
-                int fieldIndex = fileSchema.getFieldIndex(physicalName);
-                if (group.getFieldRepetitionCount(fieldIndex) == 0) {
+            if (fileIndex < 0) {
+                // Column not in file -- use default value
+                values[i] = defaultValues[i];
+            } else {
+                try {
+                    if (group.getFieldRepetitionCount(fileIndex) == 0) {
+                        values[i] = null;
+                    } else {
+                        values[i] = readValue(group, fileIndex, sparkType);
+                    }
+                } catch (Exception e) {
                     values[i] = null;
-                } else {
-                    values[i] = readValue(group, fieldIndex, sparkType);
                 }
-            } catch (Exception e) {
-                values[i] = null;
             }
         }
         return new GenericInternalRow(values);
@@ -222,5 +268,52 @@ public class DuckLakePartitionReader implements PartitionReader<InternalRow> {
         } else {
             return UTF8String.fromString(group.getValueToString(fieldIndex, 0));
         }
+    }
+
+    // ---------------------------------------------------------------
+    // Default value parsing
+    // ---------------------------------------------------------------
+
+    /**
+     * Parse a SQL default value literal into a Java object suitable for InternalRow.
+     * Handles common types: integers, floats, booleans, strings, NULL.
+     */
+    static Object parseDefault(String defaultStr, DataType sparkType) {
+        if (defaultStr == null) {
+            return null;
+        }
+        String trimmed = defaultStr.trim();
+        if (trimmed.isEmpty() || trimmed.equalsIgnoreCase("NULL")) {
+            return null;
+        }
+
+        try {
+            if (sparkType instanceof BooleanType) {
+                return Boolean.parseBoolean(trimmed);
+            } else if (sparkType instanceof ByteType) {
+                return Byte.parseByte(trimmed);
+            } else if (sparkType instanceof ShortType) {
+                return Short.parseShort(trimmed);
+            } else if (sparkType instanceof IntegerType) {
+                return Integer.parseInt(trimmed);
+            } else if (sparkType instanceof LongType) {
+                return Long.parseLong(trimmed);
+            } else if (sparkType instanceof FloatType) {
+                return Float.parseFloat(trimmed);
+            } else if (sparkType instanceof DoubleType) {
+                return Double.parseDouble(trimmed);
+            } else if (sparkType instanceof StringType) {
+                // Strip SQL string quotes: 'hello' -> hello
+                if (trimmed.startsWith("'") && trimmed.endsWith("'") && trimmed.length() >= 2) {
+                    return UTF8String.fromString(trimmed.substring(1, trimmed.length() - 1));
+                }
+                return UTF8String.fromString(trimmed);
+            } else if (sparkType instanceof BinaryType) {
+                return trimmed.getBytes();
+            }
+        } catch (NumberFormatException e) {
+            // Fall through to null
+        }
+        return null;
     }
 }
