@@ -69,6 +69,102 @@ public class DuckLakeMetadataBackend implements AutoCloseable {
     }
 
     // ---------------------------------------------------------------
+    // Snapshot queries (time travel)
+    // ---------------------------------------------------------------
+
+    /** Get snapshot by version (snapshot_id). Returns null if not found. */
+    public SnapshotInfo getSnapshotAtVersion(long version) throws SQLException {
+        try (PreparedStatement ps = getConnection().prepareStatement(
+                "SELECT snapshot_id, snapshot_time, snapshot_changes " +
+                "FROM ducklake_snapshot WHERE snapshot_id = ?")) {
+            ps.setLong(1, version);
+            try (ResultSet rs = ps.executeQuery()) {
+                if (rs.next()) {
+                    return new SnapshotInfo(
+                            rs.getLong("snapshot_id"),
+                            rs.getString("snapshot_time"),
+                            rs.getString("snapshot_changes"));
+                }
+            }
+        }
+        return null;
+    }
+
+    /** Get the latest snapshot at or before the given timestamp. Returns null if none found. */
+    public SnapshotInfo getSnapshotAtTime(String timestamp) throws SQLException {
+        try (PreparedStatement ps = getConnection().prepareStatement(
+                "SELECT snapshot_id, snapshot_time, snapshot_changes " +
+                "FROM ducklake_snapshot " +
+                "WHERE snapshot_time <= ? ORDER BY snapshot_id DESC LIMIT 1")) {
+            ps.setString(1, timestamp);
+            try (ResultSet rs = ps.executeQuery()) {
+                if (rs.next()) {
+                    return new SnapshotInfo(
+                            rs.getLong("snapshot_id"),
+                            rs.getString("snapshot_time"),
+                            rs.getString("snapshot_changes"));
+                }
+            }
+        }
+        return null;
+    }
+
+    /** List all snapshots ordered by version (ascending). */
+    public List<SnapshotInfo> listSnapshots() throws SQLException {
+        List<SnapshotInfo> result = new ArrayList<>();
+        try (Statement s = getConnection().createStatement();
+             ResultSet rs = s.executeQuery(
+                     "SELECT snapshot_id, snapshot_time, snapshot_changes " +
+                     "FROM ducklake_snapshot ORDER BY snapshot_id")) {
+            while (rs.next()) {
+                result.add(new SnapshotInfo(
+                        rs.getLong("snapshot_id"),
+                        rs.getString("snapshot_time"),
+                        rs.getString("snapshot_changes")));
+            }
+        }
+        return result;
+    }
+
+    /**
+     * Resolve a snapshot ID from version/time options.
+     * Returns the current (latest) snapshot if neither is specified.
+     *
+     * @param snapshotVersion version string (snapshot_id), or null
+     * @param snapshotTime    ISO-8601 timestamp string, or null
+     * @throws IllegalArgumentException if both are set, or if the target snapshot is not found
+     */
+    public long resolveSnapshotId(String snapshotVersion, String snapshotTime) throws SQLException {
+        if (snapshotVersion != null && snapshotTime != null) {
+            throw new IllegalArgumentException(
+                    "Cannot specify both 'snapshot_version' and 'snapshot_time' -- use one or the other");
+        }
+        if (snapshotVersion != null) {
+            long version;
+            try {
+                version = Long.parseLong(snapshotVersion);
+            } catch (NumberFormatException e) {
+                throw new IllegalArgumentException(
+                        "Invalid snapshot_version: " + snapshotVersion + " -- must be a numeric version");
+            }
+            SnapshotInfo snap = getSnapshotAtVersion(version);
+            if (snap == null) {
+                throw new IllegalArgumentException("Snapshot version " + version + " not found");
+            }
+            return snap.snapshotId;
+        }
+        if (snapshotTime != null) {
+            SnapshotInfo snap = getSnapshotAtTime(snapshotTime);
+            if (snap == null) {
+                throw new IllegalArgumentException(
+                        "No snapshot found at or before timestamp: " + snapshotTime);
+            }
+            return snap.snapshotId;
+        }
+        return getCurrentSnapshotId();
+    }
+
+    // ---------------------------------------------------------------
     // Schema queries
     // ---------------------------------------------------------------
 
@@ -155,9 +251,13 @@ public class DuckLakeMetadataBackend implements AutoCloseable {
         return getTable(tableName, "main");
     }
 
-    /** Get a table by name in a named schema. */
+    /** Get a table by name in a named schema at the current snapshot. */
     public TableInfo getTable(String tableName, String schemaName) throws SQLException {
-        long snap = getCurrentSnapshotId();
+        return getTable(tableName, schemaName, getCurrentSnapshotId());
+    }
+
+    /** Get a table by name in a named schema at a specific snapshot. */
+    public TableInfo getTable(String tableName, String schemaName, long snapshotId) throws SQLException {
         try (PreparedStatement ps = getConnection().prepareStatement(
                 "SELECT t.table_id, t.table_uuid, t.table_name, t.path, t.path_is_relative " +
                 "FROM ducklake_table t " +
@@ -167,10 +267,10 @@ public class DuckLakeMetadataBackend implements AutoCloseable {
                 "AND s.begin_snapshot <= ? AND (s.end_snapshot IS NULL OR s.end_snapshot > ?)")) {
             ps.setString(1, schemaName);
             ps.setString(2, tableName);
-            ps.setLong(3, snap);
-            ps.setLong(4, snap);
-            ps.setLong(5, snap);
-            ps.setLong(6, snap);
+            ps.setLong(3, snapshotId);
+            ps.setLong(4, snapshotId);
+            ps.setLong(5, snapshotId);
+            ps.setLong(6, snapshotId);
             try (ResultSet rs = ps.executeQuery()) {
                 if (rs.next()) {
                     return new TableInfo(
@@ -263,9 +363,13 @@ public class DuckLakeMetadataBackend implements AutoCloseable {
         return result;
     }
 
-    /** Get active delete files for a data file. */
+    /** Get active delete files for a data file at the current snapshot. */
     public List<DeleteFileInfo> getDeleteFiles(long tableId, long dataFileId) throws SQLException {
-        long snap = getCurrentSnapshotId();
+        return getDeleteFiles(tableId, dataFileId, getCurrentSnapshotId());
+    }
+
+    /** Get active delete files for a data file at a specific snapshot. */
+    public List<DeleteFileInfo> getDeleteFiles(long tableId, long dataFileId, long snapshotId) throws SQLException {
         List<DeleteFileInfo> result = new ArrayList<>();
         try (PreparedStatement ps = getConnection().prepareStatement(
                 "SELECT delete_file_id, path, path_is_relative, format, delete_count " +
@@ -274,8 +378,8 @@ public class DuckLakeMetadataBackend implements AutoCloseable {
                 "AND begin_snapshot <= ? AND (end_snapshot IS NULL OR end_snapshot > ?)")) {
             ps.setLong(1, tableId);
             ps.setLong(2, dataFileId);
-            ps.setLong(3, snap);
-            ps.setLong(4, snap);
+            ps.setLong(3, snapshotId);
+            ps.setLong(4, snapshotId);
             try (ResultSet rs = ps.executeQuery()) {
                 while (rs.next()) {
                     result.add(new DeleteFileInfo(
@@ -392,6 +496,18 @@ public class DuckLakeMetadataBackend implements AutoCloseable {
     // ---------------------------------------------------------------
     // Data classes
     // ---------------------------------------------------------------
+
+    public static class SnapshotInfo {
+        public final long snapshotId;
+        public final String snapshotTime;
+        public final String changes;
+
+        public SnapshotInfo(long snapshotId, String snapshotTime, String changes) {
+            this.snapshotId = snapshotId;
+            this.snapshotTime = snapshotTime;
+            this.changes = changes;
+        }
+    }
 
     public static class SchemaInfo {
         public final long schemaId;

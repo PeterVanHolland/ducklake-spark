@@ -14,6 +14,8 @@ import java.util.*;
 /**
  * Represents a scan of a DuckLake table. Plans input partitions
  * (one per data file) and handles file pruning via column statistics.
+ *
+ * Supports time travel via snapshot_version / snapshot_time options.
  */
 public class DuckLakeScan implements Scan, Batch {
 
@@ -45,16 +47,22 @@ public class DuckLakeScan implements Scan, Batch {
         try (DuckLakeMetadataBackend backend = createBackend()) {
             String tableName = options.get("table");
             String schemaName = options.getOrDefault("schema", "main");
-            TableInfo table = backend.getTable(tableName, schemaName);
+
+            // Resolve snapshot for time travel
+            long snapshotId = backend.resolveSnapshotId(
+                    options.getOrDefault("snapshot_version", null),
+                    options.getOrDefault("snapshot_time", null));
+
+            TableInfo table = backend.getTable(tableName, schemaName, snapshotId);
             if (table == null) {
                 throw new RuntimeException("Table not found: " + schemaName + "." + tableName);
             }
 
             String dataPath = backend.getDataPath();
-            List<DataFileInfo> files = backend.getDataFiles(table.tableId);
-            List<ColumnInfo> columns = backend.getColumns(table.tableId);
+            List<DataFileInfo> files = backend.getDataFiles(table.tableId, snapshotId);
+            List<ColumnInfo> columns = backend.getColumns(table.tableId, snapshotId);
 
-            // Build column ID → name mapping for stats-based pruning
+            // Build column ID -> name mapping for stats-based pruning
             Map<Long, String> colIdToName = new HashMap<>();
             for (ColumnInfo col : columns) {
                 colIdToName.put(col.columnId, col.name);
@@ -65,8 +73,9 @@ public class DuckLakeScan implements Scan, Batch {
                 // Resolve file path
                 String filePath = file.pathIsRelative ? dataPath + file.path : file.path;
 
-                // Get delete files for this data file
-                List<DeleteFileInfo> deleteFiles = backend.getDeleteFiles(table.tableId, file.dataFileId);
+                // Get delete files for this data file at the target snapshot
+                List<DeleteFileInfo> deleteFiles = backend.getDeleteFiles(
+                        table.tableId, file.dataFileId, snapshotId);
                 List<String> deletePaths = new ArrayList<>();
                 for (DeleteFileInfo df : deleteFiles) {
                     deletePaths.add(df.pathIsRelative ? dataPath + df.path : df.path);

@@ -21,6 +21,10 @@ import java.util.*;
  *     .option("catalog", "/path/to/catalog.ducklake")
  *     .option("table", "my_table")
  *     .load()
+ *
+ * Time travel:
+ *   .option("snapshot_version", 3)          // read at version 3
+ *   .option("snapshot_time", "2026-01-01T00:00:00")  // read at timestamp
  */
 public class DuckLakeDataSource implements TableProvider {
 
@@ -29,11 +33,17 @@ public class DuckLakeDataSource implements TableProvider {
         try (DuckLakeMetadataBackend backend = createBackend(options)) {
             String tableName = getTableName(options);
             String schemaName = options.getOrDefault("schema", "main");
-            DuckLakeMetadataBackend.TableInfo table = backend.getTable(tableName, schemaName);
+
+            // Resolve snapshot for time travel
+            long snapshotId = backend.resolveSnapshotId(
+                    options.getOrDefault("snapshot_version", null),
+                    options.getOrDefault("snapshot_time", null));
+
+            DuckLakeMetadataBackend.TableInfo table = backend.getTable(tableName, schemaName, snapshotId);
             if (table == null) {
                 throw new IllegalArgumentException("Table not found: " + schemaName + "." + tableName);
             }
-            var columns = backend.getColumns(table.tableId);
+            var columns = backend.getColumns(table.tableId, snapshotId);
             return DuckLakeTypeMapping.buildSchema(columns);
         } catch (SQLException e) {
             throw new RuntimeException("Failed to infer schema from DuckLake catalog", e);
