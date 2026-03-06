@@ -163,6 +163,47 @@ public class DuckLakeTypeMapping {
         return new StructType(fields.toArray(new StructField[0]));
     }
 
+
+    /**
+     * Convert a Spark DataType to a DuckDB/DuckLake type string.
+     */
+    public static String toDuckDBType(DataType sparkType) {
+        if (sparkType instanceof ByteType) return "TINYINT";
+        if (sparkType instanceof ShortType) return "SMALLINT";
+        if (sparkType instanceof IntegerType) return "INTEGER";
+        if (sparkType instanceof LongType) return "BIGINT";
+        if (sparkType instanceof FloatType) return "FLOAT";
+        if (sparkType instanceof DoubleType) return "DOUBLE";
+        if (sparkType instanceof DecimalType) {
+            DecimalType dt = (DecimalType) sparkType;
+            return "DECIMAL(" + dt.precision() + "," + dt.scale() + ")";
+        }
+        if (sparkType instanceof BooleanType) return "BOOLEAN";
+        if (sparkType instanceof StringType) return "VARCHAR";
+        if (sparkType instanceof BinaryType) return "BLOB";
+        if (sparkType instanceof DateType) return "DATE";
+        if (sparkType instanceof TimestampType) return "TIMESTAMP";
+        if (sparkType instanceof ArrayType) {
+            ArrayType at = (ArrayType) sparkType;
+            return toDuckDBType(at.elementType()) + "[]";
+        }
+        if (sparkType instanceof MapType) {
+            MapType mt = (MapType) sparkType;
+            return "MAP(" + toDuckDBType(mt.keyType()) + ", " + toDuckDBType(mt.valueType()) + ")";
+        }
+        if (sparkType instanceof StructType) {
+            StructType st = (StructType) sparkType;
+            StringBuilder sb = new StringBuilder("STRUCT(");
+            for (int i = 0; i < st.fields().length; i++) {
+                if (i > 0) sb.append(", ");
+                sb.append(st.fields()[i].name()).append(" ").append(toDuckDBType(st.fields()[i].dataType()));
+            }
+            sb.append(")");
+            return sb.toString();
+        }
+        return "VARCHAR";
+    }
+
     /**
      * Build a Spark StructType from DuckLake column definitions.
      */
