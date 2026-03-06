@@ -8,6 +8,7 @@ import org.apache.spark.sql.catalyst.analysis.NonEmptyNamespaceException;
 import org.apache.spark.sql.connector.catalog.*;
 import org.apache.spark.sql.connector.expressions.Transform;
 import org.apache.spark.sql.connector.read.ScanBuilder;
+import org.apache.spark.sql.sources.Filter;
 import org.apache.spark.sql.connector.write.LogicalWriteInfo;
 import org.apache.spark.sql.connector.write.WriteBuilder;
 import org.apache.spark.sql.types.StructField;
@@ -15,6 +16,7 @@ import org.apache.spark.sql.types.StructType;
 import org.apache.spark.sql.util.CaseInsensitiveStringMap;
 
 import io.ducklake.spark.reader.DuckLakeScanBuilder;
+import io.ducklake.spark.writer.DuckLakeDeleteExecutor;
 import io.ducklake.spark.writer.DuckLakeWriteBuilder;
 
 import java.sql.SQLException;
@@ -340,7 +342,7 @@ public class DuckLakeCatalog implements CatalogPlugin, TableCatalog, SupportsNam
     // Inner Table class for catalog-managed tables
     // ---------------------------------------------------------------
 
-    static class DuckLakeCatalogTable implements Table, SupportsRead, SupportsWrite {
+    static class DuckLakeCatalogTable implements Table, SupportsRead, SupportsWrite, SupportsDelete {
         private final Identifier ident;
         private final StructType schema;
         private final TableInfo tableInfo;
@@ -385,6 +387,21 @@ public class DuckLakeCatalog implements CatalogPlugin, TableCatalog, SupportsNam
             Map<String, String> merged = new HashMap<>(this.options.asCaseSensitiveMap());
             merged.putAll(info.options().asCaseSensitiveMap());
             return new DuckLakeWriteBuilder(info.schema(), new CaseInsensitiveStringMap(merged));
+        }
+
+        @Override
+        public boolean canDeleteWhere(Filter[] filters) {
+            return true;
+        }
+
+        @Override
+        public void deleteWhere(Filter[] filters) {
+            new DuckLakeDeleteExecutor(
+                    options.get("catalog"),
+                    options.getOrDefault("data_path", null),
+                    options.get("table"),
+                    options.getOrDefault("schema", "main")
+            ).deleteWhere(filters);
         }
     }
 }

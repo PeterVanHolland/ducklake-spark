@@ -1,6 +1,7 @@
 package io.ducklake.spark;
 
 import io.ducklake.spark.reader.DuckLakeScanBuilder;
+import io.ducklake.spark.writer.DuckLakeDeleteExecutor;
 import io.ducklake.spark.writer.DuckLakeWriteBuilder;
 import io.ducklake.spark.catalog.DuckLakeMetadataBackend;
 import io.ducklake.spark.util.DuckLakeTypeMapping;
@@ -8,6 +9,7 @@ import io.ducklake.spark.util.DuckLakeTypeMapping;
 import org.apache.spark.sql.connector.catalog.*;
 import org.apache.spark.sql.connector.expressions.Transform;
 import org.apache.spark.sql.connector.read.ScanBuilder;
+import org.apache.spark.sql.sources.Filter;
 import org.apache.spark.sql.connector.write.LogicalWriteInfo;
 import org.apache.spark.sql.connector.write.WriteBuilder;
 import org.apache.spark.sql.types.StructType;
@@ -87,7 +89,7 @@ public class DuckLakeDataSource implements TableProvider {
     // Inner Table class implementing SupportsRead
     // ---------------------------------------------------------------
 
-    static class DuckLakeTable implements Table, SupportsRead, SupportsWrite {
+    static class DuckLakeTable implements Table, SupportsRead, SupportsWrite, SupportsDelete {
         private final StructType schema;
         private final CaseInsensitiveStringMap options;
 
@@ -128,6 +130,21 @@ public class DuckLakeDataSource implements TableProvider {
             Map<String, String> merged = new HashMap<>(this.options.asCaseSensitiveMap());
             merged.putAll(info.options().asCaseSensitiveMap());
             return new DuckLakeWriteBuilder(info.schema(), new CaseInsensitiveStringMap(merged));
+        }
+
+        @Override
+        public boolean canDeleteWhere(Filter[] filters) {
+            return true;
+        }
+
+        @Override
+        public void deleteWhere(Filter[] filters) {
+            new DuckLakeDeleteExecutor(
+                    options.get("catalog"),
+                    options.getOrDefault("data_path", null),
+                    options.get("table"),
+                    options.getOrDefault("schema", "main")
+            ).deleteWhere(filters);
         }
     }
 }
