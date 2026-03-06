@@ -113,7 +113,8 @@ public class DuckLakeDataSource implements TableProvider {
             return new HashSet<>(Arrays.asList(
                     TableCapability.BATCH_READ,
                     TableCapability.BATCH_WRITE,
-                    TableCapability.TRUNCATE
+                    TableCapability.TRUNCATE,
+                    TableCapability.STREAMING_WRITE
             ));
         }
 

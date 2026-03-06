@@ -4,6 +4,7 @@ import io.ducklake.spark.catalog.DuckLakeMetadataBackend;
 import io.ducklake.spark.catalog.DuckLakeMetadataBackend.*;
 
 import org.apache.spark.sql.connector.write.*;
+import org.apache.spark.sql.connector.write.streaming.StreamingDataWriterFactory;
 import org.apache.spark.sql.connector.write.streaming.StreamingWrite;
 import org.apache.spark.sql.types.StructType;
 import org.apache.spark.sql.util.CaseInsensitiveStringMap;
@@ -13,10 +14,13 @@ import java.sql.SQLException;
 import java.util.*;
 
 /**
- * Manages the lifecycle of a batch write operation to a DuckLake table.
- * Creates writer factories for executors and commits file metadata to the catalog.
+ * Manages the lifecycle of a streaming write operation to a DuckLake table.
+ * Each micro-batch (epochId) creates its own snapshot in the catalog.
+ * Exactly-once semantics are provided by Spark's checkpoint mechanism —
+ * the streaming engine tracks committed epochs and will not re-commit
+ * an already-processed epoch.
  */
-public class DuckLakeBatchWrite implements Write, BatchWrite {
+public class DuckLakeStreamingWrite implements StreamingWrite {
 
     private final CaseInsensitiveStringMap options;
     private final StructType schema;
@@ -25,12 +29,10 @@ public class DuckLakeBatchWrite implements Write, BatchWrite {
     private final String dataPath;
     private final String tablePath;
     private final long[] columnIds;
-    private final boolean isOverwrite;
 
-    public DuckLakeBatchWrite(CaseInsensitiveStringMap options, StructType schema,
-                               TableInfo tableInfo, List<ColumnInfo> columns,
-                               String dataPath, String tablePath,
-                               long[] columnIds, boolean isOverwrite) {
+    public DuckLakeStreamingWrite(CaseInsensitiveStringMap options, StructType schema,
+                                   TableInfo tableInfo, List<ColumnInfo> columns,
+                                   String dataPath, String tablePath, long[] columnIds) {
         this.options = options;
         this.schema = schema;
         this.tableInfo = tableInfo;
@@ -38,28 +40,16 @@ public class DuckLakeBatchWrite implements Write, BatchWrite {
         this.dataPath = dataPath;
         this.tablePath = tablePath;
         this.columnIds = columnIds;
-        this.isOverwrite = isOverwrite;
     }
 
     @Override
-    public BatchWrite toBatch() {
-        return this;
-    }
-
-
-    @Override
-    public StreamingWrite toStreaming() {
-        return new DuckLakeStreamingWrite(options, schema, tableInfo, columns,
-                dataPath, tablePath, columnIds);
-    }
-    @Override
-    public DataWriterFactory createBatchWriterFactory(PhysicalWriteInfo info) {
+    public StreamingDataWriterFactory createStreamingWriterFactory(PhysicalWriteInfo info) {
         String writeBasePath = dataPath + tablePath;
-        return new DuckLakeDataWriterFactory(schema, columnIds, writeBasePath, tablePath);
+        return new DuckLakeStreamWriterFactory(schema, columnIds, writeBasePath, tablePath);
     }
 
     @Override
-    public void commit(WriterCommitMessage[] messages) {
+    public void commit(long epochId, WriterCommitMessage[] messages) {
         List<DuckLakeWriterCommitMessage> validMessages = new ArrayList<>();
         for (WriterCommitMessage msg : messages) {
             if (msg != null) {
@@ -70,7 +60,7 @@ public class DuckLakeBatchWrite implements Write, BatchWrite {
             }
         }
 
-        if (validMessages.isEmpty() && !isOverwrite) {
+        if (validMessages.isEmpty()) {
             return;
         }
 
@@ -84,20 +74,15 @@ public class DuckLakeBatchWrite implements Write, BatchWrite {
                 long nextFileId = snapInfo.nextFileId;
                 long newNextFileId = nextFileId + validMessages.size();
 
-                // Create new snapshot
+                // Create new snapshot for this micro-batch
                 backend.createSnapshot(newSnap, snapInfo.schemaVersion,
                         snapInfo.nextCatalogId, newNextFileId);
 
-                // If overwrite, mark existing files as deleted
-                if (isOverwrite) {
-                    backend.markDataFilesDeleted(tableInfo.tableId, newSnap);
-                }
-
                 // Get current table stats
                 TableStats tableStats = backend.getTableStats(tableInfo.tableId);
-                long rowIdStart = isOverwrite ? 0 : tableStats.nextRowId;
-                long totalRecordCount = isOverwrite ? 0 : tableStats.recordCount;
-                long totalFileSize = isOverwrite ? 0 : tableStats.fileSizeBytes;
+                long rowIdStart = tableStats.nextRowId;
+                long totalRecordCount = tableStats.recordCount;
+                long totalFileSize = tableStats.fileSizeBytes;
 
                 // Insert data files and column stats
                 long fileId = nextFileId;
@@ -121,12 +106,10 @@ public class DuckLakeBatchWrite implements Write, BatchWrite {
                 // Update table stats
                 backend.updateTableStats(tableInfo.tableId, totalRecordCount, rowIdStart, totalFileSize);
 
-                // Record snapshot changes
+                // Record snapshot changes with epoch info
                 String changes = "inserted_into_table:" + tableInfo.tableId;
-                if (isOverwrite) {
-                    changes = "deleted_from_table:" + tableInfo.tableId + "," + changes;
-                }
-                backend.insertSnapshotChanges(newSnap, changes, "ducklake-spark", "Spark write");
+                backend.insertSnapshotChanges(newSnap, changes, "ducklake-spark",
+                        "Streaming write epoch " + epochId);
 
                 backend.commitTransaction();
             } catch (Exception e) {
@@ -138,12 +121,12 @@ public class DuckLakeBatchWrite implements Write, BatchWrite {
                 throw e;
             }
         } catch (SQLException e) {
-            throw new RuntimeException("Failed to commit DuckLake write", e);
+            throw new RuntimeException("Failed to commit streaming write for epoch " + epochId, e);
         }
     }
 
     @Override
-    public void abort(WriterCommitMessage[] messages) {
+    public void abort(long epochId, WriterCommitMessage[] messages) {
         for (WriterCommitMessage msg : messages) {
             if (msg != null) {
                 DuckLakeWriterCommitMessage dlMsg = (DuckLakeWriterCommitMessage) msg;
