@@ -518,13 +518,13 @@ public class DuckLakeMetadataBackend implements AutoCloseable {
     }
 
     /** Get snapshot metadata. */
-    public SnapshotInfo getSnapshotInfo(long snapshotId) throws SQLException {
+    public CatalogState getSnapshotInfo(long snapshotId) throws SQLException {
         try (PreparedStatement ps = getConnection().prepareStatement(
                 "SELECT schema_version, next_catalog_id, next_file_id FROM ducklake_snapshot WHERE snapshot_id = ?")) {
             ps.setLong(1, snapshotId);
             try (ResultSet rs = ps.executeQuery()) {
                 if (rs.next()) {
-                    return new SnapshotInfo(
+                    return new CatalogState(
                             rs.getLong("schema_version"),
                             rs.getLong("next_catalog_id"),
                             rs.getLong("next_file_id"));
@@ -658,6 +658,217 @@ public class DuckLakeMetadataBackend implements AutoCloseable {
         }
     }
 
+
+    // ---------------------------------------------------------------
+    // DDL operations (catalog plugin)
+    // ---------------------------------------------------------------
+
+    /** Look up a schema by name at the current snapshot. Returns null if not found. */
+    public SchemaInfo getSchemaByName(String schemaName) throws SQLException {
+        long snap = getCurrentSnapshotId();
+        try (PreparedStatement ps = getConnection().prepareStatement(
+                "SELECT schema_id, schema_name, path, path_is_relative " +
+                "FROM ducklake_schema " +
+                "WHERE schema_name = ? AND begin_snapshot <= ? AND (end_snapshot IS NULL OR end_snapshot > ?)")) {
+            ps.setString(1, schemaName);
+            ps.setLong(2, snap);
+            ps.setLong(3, snap);
+            try (ResultSet rs = ps.executeQuery()) {
+                if (rs.next()) {
+                    return new SchemaInfo(
+                            rs.getLong("schema_id"),
+                            rs.getString("schema_name"),
+                            rs.getString("path"),
+                            rs.getInt("path_is_relative") == 1);
+                }
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Create a new schema in the catalog.
+     * Creates a new snapshot and inserts the schema record.
+     */
+    public SchemaInfo createSchema(String schemaName) throws SQLException {
+        beginTransaction();
+        try {
+            long currentSnap = getCurrentSnapshotId();
+            CatalogState meta = getSnapshotInfo(currentSnap);
+            long newSnap = currentSnap + 1;
+            long schemaId = meta.nextCatalogId;
+
+            createSnapshot(newSnap, meta.schemaVersion + 1, schemaId + 1, meta.nextFileId);
+            insertSnapshotChanges(newSnap, "created_schema:\"" + schemaName + "\"",
+                    "ducklake-spark", "Create schema " + schemaName);
+
+            try (PreparedStatement ps = getConnection().prepareStatement(
+                    "INSERT INTO ducklake_schema (schema_id, schema_uuid, begin_snapshot, end_snapshot, " +
+                    "schema_name, path, path_is_relative) VALUES (?, ?, ?, NULL, ?, ?, 1)")) {
+                ps.setLong(1, schemaId);
+                ps.setString(2, java.util.UUID.randomUUID().toString());
+                ps.setLong(3, newSnap);
+                ps.setString(4, schemaName);
+                ps.setString(5, schemaName + "/");
+                ps.executeUpdate();
+            }
+
+            commitTransaction();
+            return new SchemaInfo(schemaId, schemaName, schemaName + "/", true);
+        } catch (Exception e) {
+            rollbackTransaction();
+            throw e instanceof SQLException ? (SQLException) e : new SQLException(e);
+        }
+    }
+
+    /**
+     * Drop a schema by marking it as deleted at a new snapshot.
+     */
+    public void dropSchema(long schemaId) throws SQLException {
+        beginTransaction();
+        try {
+            long currentSnap = getCurrentSnapshotId();
+            CatalogState meta = getSnapshotInfo(currentSnap);
+            long newSnap = currentSnap + 1;
+
+            createSnapshot(newSnap, meta.schemaVersion + 1, meta.nextCatalogId, meta.nextFileId);
+            insertSnapshotChanges(newSnap, "dropped_schema:" + schemaId,
+                    "ducklake-spark", "Drop schema");
+
+            try (PreparedStatement ps = getConnection().prepareStatement(
+                    "UPDATE ducklake_schema SET end_snapshot = ? WHERE schema_id = ? AND end_snapshot IS NULL")) {
+                ps.setLong(1, newSnap);
+                ps.setLong(2, schemaId);
+                ps.executeUpdate();
+            }
+
+            commitTransaction();
+        } catch (Exception e) {
+            rollbackTransaction();
+            throw e instanceof SQLException ? (SQLException) e : new SQLException(e);
+        }
+    }
+
+    /**
+     * Create a new table with columns. Creates a snapshot and inserts table + column records.
+     */
+    public TableInfo createTableEntry(long schemaId, String tableName,
+                                      String[] colNames, String[] colTypes) throws SQLException {
+        beginTransaction();
+        try {
+            long currentSnap = getCurrentSnapshotId();
+            CatalogState meta = getSnapshotInfo(currentSnap);
+            long newSnap = currentSnap + 1;
+
+            long tableId = meta.nextCatalogId;
+            long nextCatalogId = tableId + 1 + colNames.length;
+
+            createSnapshot(newSnap, meta.schemaVersion + 1, nextCatalogId, meta.nextFileId);
+            insertSnapshotChanges(newSnap, "created_table:" + tableId,
+                    "ducklake-spark", "Create table " + tableName);
+
+            // Look up schema path
+            String schemaPath = "";
+            try (PreparedStatement ps = getConnection().prepareStatement(
+                    "SELECT path FROM ducklake_schema WHERE schema_id = ?")) {
+                ps.setLong(1, schemaId);
+                try (ResultSet rs = ps.executeQuery()) {
+                    if (rs.next()) {
+                        schemaPath = rs.getString("path");
+                        if (schemaPath == null) schemaPath = "";
+                    }
+                }
+            }
+            String tablePath = schemaPath;
+            if (!tablePath.isEmpty() && !tablePath.endsWith("/")) tablePath += "/";
+            tablePath += tableName + "/";
+
+            String tableUuid = java.util.UUID.randomUUID().toString();
+
+            try (PreparedStatement ps = getConnection().prepareStatement(
+                    "INSERT INTO ducklake_table (table_id, table_uuid, begin_snapshot, end_snapshot, " +
+                    "schema_id, table_name, path, path_is_relative) VALUES (?, ?, ?, NULL, ?, ?, ?, 1)")) {
+                ps.setLong(1, tableId);
+                ps.setString(2, tableUuid);
+                ps.setLong(3, newSnap);
+                ps.setLong(4, schemaId);
+                ps.setString(5, tableName);
+                ps.setString(6, tablePath);
+                ps.executeUpdate();
+            }
+
+            long colId = tableId + 1;
+            for (int i = 0; i < colNames.length; i++) {
+                try (PreparedStatement ps = getConnection().prepareStatement(
+                        "INSERT INTO ducklake_column (column_id, begin_snapshot, end_snapshot, table_id, " +
+                        "column_order, column_name, column_type, initial_default, default_value, " +
+                        "nulls_allowed, parent_column, default_value_type, default_value_dialect) " +
+                        "VALUES (?, ?, NULL, ?, ?, ?, ?, NULL, NULL, 1, NULL, NULL, NULL)")) {
+                    ps.setLong(1, colId);
+                    ps.setLong(2, newSnap);
+                    ps.setLong(3, tableId);
+                    ps.setInt(4, i);
+                    ps.setString(5, colNames[i]);
+                    ps.setString(6, colTypes[i]);
+                    ps.executeUpdate();
+                }
+                colId++;
+            }
+
+            try (PreparedStatement ps = getConnection().prepareStatement(
+                    "INSERT INTO ducklake_table_stats (table_id, record_count, next_row_id, file_size_bytes) " +
+                    "VALUES (?, 0, 0, 0)")) {
+                ps.setLong(1, tableId);
+                ps.executeUpdate();
+            }
+
+            commitTransaction();
+            return new TableInfo(tableId, tableUuid, tableName, tablePath, true);
+        } catch (Exception e) {
+            rollbackTransaction();
+            throw e instanceof SQLException ? (SQLException) e : new SQLException(e);
+        }
+    }
+
+    /**
+     * Drop a table by marking it and its columns/data files as deleted.
+     */
+    public boolean dropTableEntry(long tableId) throws SQLException {
+        beginTransaction();
+        try {
+            long currentSnap = getCurrentSnapshotId();
+            CatalogState meta = getSnapshotInfo(currentSnap);
+            long newSnap = currentSnap + 1;
+
+            createSnapshot(newSnap, meta.schemaVersion + 1, meta.nextCatalogId, meta.nextFileId);
+            insertSnapshotChanges(newSnap, "dropped_table:" + tableId,
+                    "ducklake-spark", "Drop table");
+
+            int updated;
+            try (PreparedStatement ps = getConnection().prepareStatement(
+                    "UPDATE ducklake_table SET end_snapshot = ? WHERE table_id = ? AND end_snapshot IS NULL")) {
+                ps.setLong(1, newSnap);
+                ps.setLong(2, tableId);
+                updated = ps.executeUpdate();
+            }
+
+            try (PreparedStatement ps = getConnection().prepareStatement(
+                    "UPDATE ducklake_column SET end_snapshot = ? WHERE table_id = ? AND end_snapshot IS NULL")) {
+                ps.setLong(1, newSnap);
+                ps.setLong(2, tableId);
+                ps.executeUpdate();
+            }
+
+            markDataFilesDeleted(tableId, newSnap);
+
+            commitTransaction();
+            return updated > 0;
+        } catch (Exception e) {
+            rollbackTransaction();
+            throw e instanceof SQLException ? (SQLException) e : new SQLException(e);
+        }
+    }
+
     // ---------------------------------------------------------------
     // Data classes
     // ---------------------------------------------------------------
@@ -786,12 +997,12 @@ public class DuckLakeMetadataBackend implements AutoCloseable {
         }
     }
 
-    public static class SnapshotInfo {
+    public static class CatalogState {
         public final long schemaVersion;
         public final long nextCatalogId;
         public final long nextFileId;
 
-        public SnapshotInfo(long schemaVersion, long nextCatalogId, long nextFileId) {
+        public CatalogState(long schemaVersion, long nextCatalogId, long nextFileId) {
             this.schemaVersion = schemaVersion;
             this.nextCatalogId = nextCatalogId;
             this.nextFileId = nextFileId;
