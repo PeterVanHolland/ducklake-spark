@@ -154,7 +154,62 @@ public class DuckLakeCatalog implements CatalogPlugin, TableCatalog, SupportsNam
 
     @Override
     public Table alterTable(Identifier ident, TableChange... changes) throws NoSuchTableException {
-        throw new UnsupportedOperationException("ALTER TABLE is not yet supported by DuckLakeCatalog");
+        String schemaName = resolveSchemaName(ident.namespace());
+        String tableName = ident.name();
+
+        try (DuckLakeMetadataBackend backend = createBackend()) {
+            SchemaInfo schema = backend.getSchemaByName(schemaName);
+            if (schema == null) {
+                throw new NoSuchTableException(ident);
+            }
+            TableInfo tableInfo = backend.getTable(schema.schemaId, tableName);
+            if (tableInfo == null) {
+                throw new NoSuchTableException(ident);
+            }
+
+            for (TableChange change : changes) {
+                if (change instanceof TableChange.AddColumn) {
+                    TableChange.AddColumn add = (TableChange.AddColumn) change;
+                    String[] fieldNames = add.fieldNames();
+                    String colName = fieldNames[fieldNames.length - 1];
+                    String colType = DuckLakeTypeMapping.toDuckDBType(add.dataType());
+                    boolean nullable = add.isNullable();
+                    backend.addColumn(tableInfo.tableId, colName, colType, nullable);
+                } else if (change instanceof TableChange.DeleteColumn) {
+                    TableChange.DeleteColumn del = (TableChange.DeleteColumn) change;
+                    String[] fieldNames = del.fieldNames();
+                    String colName = fieldNames[fieldNames.length - 1];
+                    backend.dropColumn(tableInfo.tableId, colName);
+                } else if (change instanceof TableChange.RenameColumn) {
+                    TableChange.RenameColumn rename = (TableChange.RenameColumn) change;
+                    String[] fieldNames = rename.fieldNames();
+                    String oldName = fieldNames[fieldNames.length - 1];
+                    backend.renameColumn(tableInfo.tableId, oldName, rename.newName());
+                } else if (change instanceof TableChange.UpdateColumnType) {
+                    TableChange.UpdateColumnType updateType = (TableChange.UpdateColumnType) change;
+                    String[] fieldNames = updateType.fieldNames();
+                    String colName = fieldNames[fieldNames.length - 1];
+                    String newType = DuckLakeTypeMapping.toDuckDBType(updateType.newDataType());
+                    backend.updateColumnType(tableInfo.tableId, colName, newType);
+                } else if (change instanceof TableChange.SetProperty) {
+                    // Table properties/tags — silently ignore for now
+                } else if (change instanceof TableChange.RemoveProperty) {
+                    // Table properties/tags — silently ignore for now
+                } else {
+                    throw new UnsupportedOperationException(
+                            "Unsupported ALTER TABLE change: " + change.getClass().getSimpleName());
+                }
+            }
+
+            // Reload the table with updated schema
+            List<ColumnInfo> columns = backend.getColumns(tableInfo.tableId);
+            StructType sparkSchema = DuckLakeTypeMapping.buildSchema(columns);
+            return new DuckLakeCatalogTable(ident, sparkSchema, tableInfo, buildTableOptions(schemaName, tableName));
+        } catch (NoSuchTableException e) {
+            throw e;
+        } catch (SQLException e) {
+            throw new RuntimeException("Failed to alter table " + ident, e);
+        }
     }
 
     @Override
