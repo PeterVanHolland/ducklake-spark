@@ -202,7 +202,7 @@ public class DuckLakeDeleteExecutor {
     /**
      * Write a delete file (Parquet) with a single {@code row_id} column.
      */
-    static void writeDeleteFile(String absolutePath, List<Long> rowIds) {
+    public static void writeDeleteFile(String absolutePath, List<Long> rowIds) {
         MessageType deleteSchema = Types.buildMessage()
                 .required(PrimitiveType.PrimitiveTypeName.INT64).named("row_id")
                 .named("delete_file");
