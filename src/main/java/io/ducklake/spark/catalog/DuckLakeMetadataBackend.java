@@ -991,6 +991,266 @@ public class DuckLakeMetadataBackend implements AutoCloseable {
     }
 
     // ---------------------------------------------------------------
+    // ALTER TABLE operations
+    // ---------------------------------------------------------------
+
+    /**
+     * Add a column to a table. Creates a new snapshot and inserts a column record.
+     *
+     * @param tableId    the table to alter
+     * @param columnName new column name
+     * @param columnType DuckDB type string (e.g. "INTEGER", "VARCHAR")
+     * @param nullable   whether the column allows nulls
+     * @return the column_id assigned to the new column
+     */
+    public long addColumn(long tableId, String columnName, String columnType, boolean nullable) throws SQLException {
+        beginTransaction();
+        try {
+            long currentSnap = getCurrentSnapshotId();
+            CatalogState meta = getSnapshotInfo(currentSnap);
+            long newSnap = currentSnap + 1;
+            long columnId = meta.nextCatalogId;
+
+            createSnapshot(newSnap, meta.schemaVersion + 1, columnId + 1, meta.nextFileId);
+            insertSnapshotChanges(newSnap, "added_column:\"" + columnName + "\"",
+                    "ducklake-spark", "Add column " + columnName);
+
+            // Determine column_order: max existing order + 1
+            int colOrder = 0;
+            try (PreparedStatement ps = getConnection().prepareStatement(
+                    "SELECT MAX(column_order) FROM ducklake_column " +
+                    "WHERE table_id = ? AND end_snapshot IS NULL")) {
+                ps.setLong(1, tableId);
+                try (ResultSet rs = ps.executeQuery()) {
+                    if (rs.next() && rs.getObject(1) != null) {
+                        colOrder = rs.getInt(1) + 1;
+                    }
+                }
+            }
+
+            try (PreparedStatement ps = getConnection().prepareStatement(
+                    "INSERT INTO ducklake_column (column_id, begin_snapshot, end_snapshot, table_id, " +
+                    "column_order, column_name, column_type, initial_default, default_value, " +
+                    "nulls_allowed, parent_column, default_value_type, default_value_dialect) " +
+                    "VALUES (?, ?, NULL, ?, ?, ?, ?, NULL, NULL, ?, NULL, NULL, NULL)")) {
+                ps.setLong(1, columnId);
+                ps.setLong(2, newSnap);
+                ps.setLong(3, tableId);
+                ps.setInt(4, colOrder);
+                ps.setString(5, columnName);
+                ps.setString(6, columnType);
+                ps.setInt(7, nullable ? 1 : 0);
+                ps.executeUpdate();
+            }
+
+            commitTransaction();
+            return columnId;
+        } catch (Exception e) {
+            rollbackTransaction();
+            throw e instanceof SQLException ? (SQLException) e : new SQLException(e);
+        }
+    }
+
+    /**
+     * Drop a column from a table by setting its end_snapshot.
+     *
+     * @param tableId    the table to alter
+     * @param columnName column to drop
+     * @throws SQLException if the column is not found or DB error
+     */
+    public void dropColumn(long tableId, String columnName) throws SQLException {
+        beginTransaction();
+        try {
+            long currentSnap = getCurrentSnapshotId();
+            CatalogState meta = getSnapshotInfo(currentSnap);
+            long newSnap = currentSnap + 1;
+
+            createSnapshot(newSnap, meta.schemaVersion + 1, meta.nextCatalogId, meta.nextFileId);
+            insertSnapshotChanges(newSnap, "dropped_column:\"" + columnName + "\"",
+                    "ducklake-spark", "Drop column " + columnName);
+
+            int updated;
+            try (PreparedStatement ps = getConnection().prepareStatement(
+                    "UPDATE ducklake_column SET end_snapshot = ? " +
+                    "WHERE table_id = ? AND column_name = ? AND end_snapshot IS NULL")) {
+                ps.setLong(1, newSnap);
+                ps.setLong(2, tableId);
+                ps.setString(3, columnName);
+                updated = ps.executeUpdate();
+            }
+
+            if (updated == 0) {
+                throw new SQLException("Column '" + columnName + "' not found in table " + tableId);
+            }
+
+            commitTransaction();
+        } catch (Exception e) {
+            rollbackTransaction();
+            throw e instanceof SQLException ? (SQLException) e : new SQLException(e);
+        }
+    }
+
+    /**
+     * Rename a column. Ends the old column record and inserts a new one with the same
+     * column_id but a new name -- this preserves field-id-based matching for schema evolution.
+     *
+     * @param tableId the table to alter
+     * @param oldName current column name
+     * @param newName new column name
+     * @throws SQLException if the column is not found or DB error
+     */
+    public void renameColumn(long tableId, String oldName, String newName) throws SQLException {
+        beginTransaction();
+        try {
+            long currentSnap = getCurrentSnapshotId();
+            CatalogState meta = getSnapshotInfo(currentSnap);
+            long newSnap = currentSnap + 1;
+
+            // Look up existing column metadata
+            long columnId;
+            String colType;
+            int colOrder;
+            boolean nullable;
+            String initialDefault;
+            try (PreparedStatement ps = getConnection().prepareStatement(
+                    "SELECT column_id, column_type, column_order, nulls_allowed, initial_default " +
+                    "FROM ducklake_column WHERE table_id = ? AND column_name = ? AND end_snapshot IS NULL")) {
+                ps.setLong(1, tableId);
+                ps.setString(2, oldName);
+                try (ResultSet rs = ps.executeQuery()) {
+                    if (!rs.next()) {
+                        throw new SQLException("Column '" + oldName + "' not found in table " + tableId);
+                    }
+                    columnId = rs.getLong("column_id");
+                    colType = rs.getString("column_type");
+                    colOrder = rs.getInt("column_order");
+                    nullable = rs.getInt("nulls_allowed") == 1;
+                    initialDefault = rs.getString("initial_default");
+                }
+            }
+
+            createSnapshot(newSnap, meta.schemaVersion + 1, meta.nextCatalogId, meta.nextFileId);
+            insertSnapshotChanges(newSnap, "renamed_column:\"" + oldName + "\"->\"" + newName + "\"",
+                    "ducklake-spark", "Rename column " + oldName + " to " + newName);
+
+            // End old column record
+            try (PreparedStatement ps = getConnection().prepareStatement(
+                    "UPDATE ducklake_column SET end_snapshot = ? " +
+                    "WHERE column_id = ? AND table_id = ? AND end_snapshot IS NULL")) {
+                ps.setLong(1, newSnap);
+                ps.setLong(2, columnId);
+                ps.setLong(3, tableId);
+                ps.executeUpdate();
+            }
+
+            // Insert new record with same column_id but new name
+            try (PreparedStatement ps = getConnection().prepareStatement(
+                    "INSERT INTO ducklake_column (column_id, begin_snapshot, end_snapshot, table_id, " +
+                    "column_order, column_name, column_type, initial_default, default_value, " +
+                    "nulls_allowed, parent_column, default_value_type, default_value_dialect) " +
+                    "VALUES (?, ?, NULL, ?, ?, ?, ?, ?, NULL, ?, NULL, NULL, NULL)")) {
+                ps.setLong(1, columnId);
+                ps.setLong(2, newSnap);
+                ps.setLong(3, tableId);
+                ps.setInt(4, colOrder);
+                ps.setString(5, newName);
+                ps.setString(6, colType);
+                if (initialDefault != null) {
+                    ps.setString(7, initialDefault);
+                } else {
+                    ps.setNull(7, java.sql.Types.VARCHAR);
+                }
+                ps.setInt(8, nullable ? 1 : 0);
+                ps.executeUpdate();
+            }
+
+            commitTransaction();
+        } catch (Exception e) {
+            rollbackTransaction();
+            throw e instanceof SQLException ? (SQLException) e : new SQLException(e);
+        }
+    }
+
+    /**
+     * Update the type of a column. Ends the old column record and inserts a new one
+     * with the same column_id but a new type.
+     *
+     * @param tableId    the table to alter
+     * @param columnName column to update
+     * @param newType    new DuckDB type string
+     * @throws SQLException if the column is not found or DB error
+     */
+    public void updateColumnType(long tableId, String columnName, String newType) throws SQLException {
+        beginTransaction();
+        try {
+            long currentSnap = getCurrentSnapshotId();
+            CatalogState meta = getSnapshotInfo(currentSnap);
+            long newSnap = currentSnap + 1;
+
+            // Look up existing column metadata
+            long columnId;
+            int colOrder;
+            boolean nullable;
+            String initialDefault;
+            try (PreparedStatement ps = getConnection().prepareStatement(
+                    "SELECT column_id, column_order, nulls_allowed, initial_default " +
+                    "FROM ducklake_column WHERE table_id = ? AND column_name = ? AND end_snapshot IS NULL")) {
+                ps.setLong(1, tableId);
+                ps.setString(2, columnName);
+                try (ResultSet rs = ps.executeQuery()) {
+                    if (!rs.next()) {
+                        throw new SQLException("Column '" + columnName + "' not found in table " + tableId);
+                    }
+                    columnId = rs.getLong("column_id");
+                    colOrder = rs.getInt("column_order");
+                    nullable = rs.getInt("nulls_allowed") == 1;
+                    initialDefault = rs.getString("initial_default");
+                }
+            }
+
+            createSnapshot(newSnap, meta.schemaVersion + 1, meta.nextCatalogId, meta.nextFileId);
+            insertSnapshotChanges(newSnap, "updated_column_type:\"" + columnName + "\"->\"" + newType + "\"",
+                    "ducklake-spark", "Update column type " + columnName + " to " + newType);
+
+            // End old column record
+            try (PreparedStatement ps = getConnection().prepareStatement(
+                    "UPDATE ducklake_column SET end_snapshot = ? " +
+                    "WHERE column_id = ? AND table_id = ? AND end_snapshot IS NULL")) {
+                ps.setLong(1, newSnap);
+                ps.setLong(2, columnId);
+                ps.setLong(3, tableId);
+                ps.executeUpdate();
+            }
+
+            // Insert new record with same column_id but new type
+            try (PreparedStatement ps = getConnection().prepareStatement(
+                    "INSERT INTO ducklake_column (column_id, begin_snapshot, end_snapshot, table_id, " +
+                    "column_order, column_name, column_type, initial_default, default_value, " +
+                    "nulls_allowed, parent_column, default_value_type, default_value_dialect) " +
+                    "VALUES (?, ?, NULL, ?, ?, ?, ?, ?, NULL, ?, NULL, NULL, NULL)")) {
+                ps.setLong(1, columnId);
+                ps.setLong(2, newSnap);
+                ps.setLong(3, tableId);
+                ps.setInt(4, colOrder);
+                ps.setString(5, columnName);
+                ps.setString(6, newType);
+                if (initialDefault != null) {
+                    ps.setString(7, initialDefault);
+                } else {
+                    ps.setNull(7, java.sql.Types.VARCHAR);
+                }
+                ps.setInt(8, nullable ? 1 : 0);
+                ps.executeUpdate();
+            }
+
+            commitTransaction();
+        } catch (Exception e) {
+            rollbackTransaction();
+            throw e instanceof SQLException ? (SQLException) e : new SQLException(e);
+        }
+    }
+
+    // ---------------------------------------------------------------
     // Data classes
     // ---------------------------------------------------------------
 
