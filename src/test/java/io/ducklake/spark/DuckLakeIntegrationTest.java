@@ -371,8 +371,6 @@ public class DuckLakeIntegrationTest {
         assertArrayEquals(new byte[]{(byte) 0x00, (byte) 0xFF}, (byte[]) r1.get(4));
     }
 
-    @Ignore("Complex types (ARRAY, STRUCT, MAP) are written as strings by the Parquet writer fallback. " +
-            "Proper nested type support requires implementing Group-based Parquet read/write for these types.")
     @Test
     public void testTypeRoundTripComplexTypes() {
         spark.sql("CREATE TABLE ducklake.main.types_complex (" +
@@ -415,6 +413,147 @@ public class DuckLakeIntegrationTest {
     }
 
     // ===============================================================
+
+    @Test
+    public void testArrayWithNulls() {
+        spark.sql("CREATE TABLE ducklake.main.arr_nulls (id INT, vals ARRAY<STRING>)");
+
+        spark.sql("INSERT INTO ducklake.main.arr_nulls VALUES " +
+                "(1, array('hello', null, 'world')), " +
+                "(2, array(null, null)), " +
+                "(3, null)");
+
+        Dataset<Row> result = spark.sql(
+                "SELECT id, vals[0], vals[1], vals[2], size(vals) " +
+                "FROM ducklake.main.arr_nulls ORDER BY id");
+        List<Row> rows = result.collectAsList();
+        assertEquals(3, rows.size());
+
+        // Row 1: ['hello', null, 'world']
+        assertEquals("hello", rows.get(0).getString(1));
+        assertTrue(rows.get(0).isNullAt(2));
+        assertEquals("world", rows.get(0).getString(3));
+        assertEquals(3, rows.get(0).getInt(4));
+
+        // Row 2: [null, null]
+        assertTrue(rows.get(1).isNullAt(1));
+        assertTrue(rows.get(1).isNullAt(2));
+        assertEquals(2, rows.get(1).getInt(4));
+
+        // Row 3: null array -> size returns -1
+        assertEquals(-1, rows.get(2).getInt(4));
+    }
+
+    @Test
+    public void testStructWithMultipleFields() {
+        spark.sql("CREATE TABLE ducklake.main.struct_multi (" +
+                "id INT, " +
+                "info STRUCT<name: STRING, score: DOUBLE, active: BOOLEAN>)");
+
+        spark.sql("INSERT INTO ducklake.main.struct_multi VALUES " +
+                "(1, named_struct('name', 'alice', 'score', 95.5, 'active', true)), " +
+                "(2, named_struct('name', 'bob', 'score', 82.3, 'active', false)), " +
+                "(3, null)");
+
+        Dataset<Row> result = spark.sql(
+                "SELECT id, info.name, info.score, info.active " +
+                "FROM ducklake.main.struct_multi ORDER BY id");
+        List<Row> rows = result.collectAsList();
+        assertEquals(3, rows.size());
+
+        assertEquals("alice", rows.get(0).getString(1));
+        assertEquals(95.5, rows.get(0).getDouble(2), 0.001);
+        assertTrue(rows.get(0).getBoolean(3));
+
+        assertEquals("bob", rows.get(1).getString(1));
+        assertEquals(82.3, rows.get(1).getDouble(2), 0.001);
+        assertFalse(rows.get(1).getBoolean(3));
+
+        // Row 3: null struct
+        assertTrue(rows.get(2).isNullAt(1));
+        assertTrue(rows.get(2).isNullAt(2));
+        assertTrue(rows.get(2).isNullAt(3));
+    }
+
+    @Test
+    public void testMapWithVariousTypes() {
+        spark.sql("CREATE TABLE ducklake.main.map_types (" +
+                "id INT, " +
+                "scores MAP<STRING, DOUBLE>)");
+
+        spark.sql("INSERT INTO ducklake.main.map_types VALUES " +
+                "(1, map('math', 95.0, 'english', 88.5)), " +
+                "(2, map('science', 72.0)), " +
+                "(3, null)");
+
+        Dataset<Row> result = spark.sql(
+                "SELECT id, scores['math'], scores['english'], scores['science'] " +
+                "FROM ducklake.main.map_types ORDER BY id");
+        List<Row> rows = result.collectAsList();
+        assertEquals(3, rows.size());
+
+        assertEquals(95.0, rows.get(0).getDouble(1), 0.001);
+        assertEquals(88.5, rows.get(0).getDouble(2), 0.001);
+        assertTrue(rows.get(0).isNullAt(3)); // 'science' not in row 1
+
+        assertTrue(rows.get(1).isNullAt(1)); // 'math' not in row 2
+        assertTrue(rows.get(1).isNullAt(2)); // 'english' not in row 2
+        assertEquals(72.0, rows.get(1).getDouble(3), 0.001);
+
+        // Row 3: null map
+        assertTrue(rows.get(2).isNullAt(1));
+    }
+
+    @Test
+    public void testNestedComplexTypes() {
+        // Array of structs
+        spark.sql("CREATE TABLE ducklake.main.nested_complex (" +
+                "id INT, " +
+                "people ARRAY<STRUCT<name: STRING, age: INT>>)");
+
+        spark.sql("INSERT INTO ducklake.main.nested_complex VALUES " +
+                "(1, array(named_struct('name', 'alice', 'age', 30), " +
+                "named_struct('name', 'bob', 'age', 25)))");
+
+        Dataset<Row> result = spark.sql(
+                "SELECT people[0].name, people[0].age, people[1].name, people[1].age " +
+                "FROM ducklake.main.nested_complex");
+        Row row = result.collectAsList().get(0);
+        assertEquals("alice", row.getString(0));
+        assertEquals(30, row.getInt(1));
+        assertEquals("bob", row.getString(2));
+        assertEquals(25, row.getInt(3));
+    }
+
+    @Test
+    public void testMultipleRowsComplexTypes() {
+        spark.sql("CREATE TABLE ducklake.main.multi_complex (" +
+                "id INT, " +
+                "tags ARRAY<STRING>, " +
+                "meta MAP<STRING, INT>)");
+
+        // Insert multiple rows with varying sizes
+        spark.sql("INSERT INTO ducklake.main.multi_complex VALUES " +
+                "(1, array('a', 'b', 'c'), map('x', 1, 'y', 2)), " +
+                "(2, array('d'), map('z', 3)), " +
+                "(3, array(), map())");
+
+        Dataset<Row> result = spark.sql(
+                "SELECT id, size(tags), size(meta) " +
+                "FROM ducklake.main.multi_complex ORDER BY id");
+        List<Row> rows = result.collectAsList();
+        assertEquals(3, rows.size());
+
+        assertEquals(3, rows.get(0).getInt(1));
+        assertEquals(2, rows.get(0).getInt(2));
+
+        assertEquals(1, rows.get(1).getInt(1));
+        assertEquals(1, rows.get(1).getInt(2));
+
+        assertEquals(0, rows.get(2).getInt(1));
+        assertEquals(0, rows.get(2).getInt(2));
+    }
+
     // 4. Concurrent read access
     // ===============================================================
 
