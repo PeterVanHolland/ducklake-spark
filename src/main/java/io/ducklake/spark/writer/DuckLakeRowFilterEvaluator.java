@@ -213,7 +213,7 @@ public class DuckLakeRowFilterEvaluator {
     }
 
     @SuppressWarnings({"unchecked", "rawtypes"})
-    static int compareValues(Object rowValue, Object filterValue) {
+    public static int compareValues(Object rowValue, Object filterValue) {
         if (rowValue == null && filterValue == null) return 0;
         if (rowValue == null) return -1;
         if (filterValue == null) return 1;
