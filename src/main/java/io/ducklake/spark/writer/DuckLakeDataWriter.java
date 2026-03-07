@@ -5,6 +5,9 @@ import org.apache.spark.sql.connector.write.DataWriter;
 import org.apache.spark.sql.connector.write.WriterCommitMessage;
 import org.apache.spark.sql.types.*;
 
+import org.apache.spark.sql.catalyst.util.ArrayData;
+import org.apache.spark.sql.catalyst.util.MapData;
+
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.Path;
 import org.apache.parquet.example.data.Group;
@@ -187,6 +190,60 @@ public class DuckLakeDataWriter implements DataWriter<InternalRow> {
                             .id(fieldId).named(name);
                 }
             }
+        } else if (type instanceof ArrayType) {
+            // Standard 3-level Parquet LIST encoding
+            ArrayType at = (ArrayType) type;
+            org.apache.parquet.schema.Type elementType =
+                    sparkTypeToParquetType("element", at.elementType(), at.containsNull(), 0);
+            GroupType repeatedList = Types.repeatedGroup()
+                    .addField(elementType)
+                    .named("list");
+            if (nullable) {
+                return Types.optionalGroup()
+                        .as(LogicalTypeAnnotation.listType())
+                        .addField(repeatedList)
+                        .id(fieldId)
+                        .named(name);
+            } else {
+                return Types.requiredGroup()
+                        .as(LogicalTypeAnnotation.listType())
+                        .addField(repeatedList)
+                        .id(fieldId)
+                        .named(name);
+            }
+        } else if (type instanceof StructType) {
+            StructType st = (StructType) type;
+            Types.GroupBuilder<GroupType> builder = nullable
+                    ? Types.optionalGroup() : Types.requiredGroup();
+            for (int i = 0; i < st.fields().length; i++) {
+                StructField f = st.fields()[i];
+                builder.addField(sparkTypeToParquetType(f.name(), f.dataType(), f.nullable(), 0));
+            }
+            return builder.id(fieldId).named(name);
+        } else if (type instanceof MapType) {
+            // Standard Parquet MAP encoding
+            MapType mt = (MapType) type;
+            org.apache.parquet.schema.Type keyType =
+                    sparkTypeToParquetType("key", mt.keyType(), false, 0);
+            org.apache.parquet.schema.Type valueType =
+                    sparkTypeToParquetType("value", mt.valueType(), mt.valueContainsNull(), 0);
+            GroupType repeatedKeyValue = Types.repeatedGroup()
+                    .addField(keyType)
+                    .addField(valueType)
+                    .named("key_value");
+            if (nullable) {
+                return Types.optionalGroup()
+                        .as(LogicalTypeAnnotation.mapType())
+                        .addField(repeatedKeyValue)
+                        .id(fieldId)
+                        .named(name);
+            } else {
+                return Types.requiredGroup()
+                        .as(LogicalTypeAnnotation.mapType())
+                        .addField(repeatedKeyValue)
+                        .id(fieldId)
+                        .named(name);
+            }
         }
         // Fallback: store as string
         return primitive(nullable, PrimitiveTypeName.BINARY,
@@ -211,7 +268,7 @@ public class DuckLakeDataWriter implements DataWriter<InternalRow> {
     }
 
     // ---------------------------------------------------------------
-    // InternalRow → Parquet Group conversion
+    // InternalRow -> Parquet Group conversion
     // ---------------------------------------------------------------
 
     private Object writeField(Group group, int fieldIndex, InternalRow row, int ordinal, DataType type) {
@@ -281,11 +338,136 @@ public class DuckLakeDataWriter implements DataWriter<InternalRow> {
                 group.add(fieldIndex, Binary.fromConstantByteArray(padded));
                 return null; // skip stats for large decimals
             }
+        } else if (type instanceof ArrayType) {
+            ArrayType at = (ArrayType) type;
+            ArrayData arrayData = row.getArray(ordinal);
+            writeArrayToGroup(group, fieldIndex, arrayData, at.elementType());
+            return null; // skip stats for complex types
+        } else if (type instanceof StructType) {
+            StructType st = (StructType) type;
+            InternalRow structRow = row.getStruct(ordinal, st.fields().length);
+            writeStructToGroup(group, fieldIndex, structRow, st);
+            return null; // skip stats for complex types
+        } else if (type instanceof MapType) {
+            MapType mt = (MapType) type;
+            MapData mapData = row.getMap(ordinal);
+            writeMapToGroup(group, fieldIndex, mapData, mt.keyType(), mt.valueType());
+            return null; // skip stats for complex types
         }
         // Fallback: write as string
         String v = row.get(ordinal, type).toString();
         group.add(fieldIndex, v);
         return v;
+    }
+
+    // ---------------------------------------------------------------
+    // Complex type writers
+    // ---------------------------------------------------------------
+
+    /**
+     * Write an ArrayData as a Parquet LIST group (3-level encoding).
+     * Schema: group (LIST) { repeated group list { optional element } }
+     */
+    private void writeArrayToGroup(Group parentGroup, int fieldIndex,
+                                    ArrayData arrayData, DataType elementType) {
+        Group listGroup = parentGroup.addGroup(fieldIndex);
+        for (int j = 0; j < arrayData.numElements(); j++) {
+            Group elementGroup = listGroup.addGroup(0); // "list" repeated group
+            if (!arrayData.isNullAt(j)) {
+                writeValueFromArrayData(elementGroup, 0, arrayData, j, elementType);
+            }
+            // null elements: the optional "element" field is simply not populated
+        }
+    }
+
+    /**
+     * Write an InternalRow (struct) as a Parquet group with named fields.
+     */
+    private void writeStructToGroup(Group parentGroup, int fieldIndex,
+                                     InternalRow structRow, StructType structType) {
+        Group structGroup = parentGroup.addGroup(fieldIndex);
+        for (int j = 0; j < structType.fields().length; j++) {
+            if (!structRow.isNullAt(j)) {
+                writeField(structGroup, j, structRow, j, structType.fields()[j].dataType());
+            }
+        }
+    }
+
+    /**
+     * Write a MapData as a Parquet MAP group.
+     * Schema: group (MAP) { repeated group key_value { required key; optional value } }
+     */
+    private void writeMapToGroup(Group parentGroup, int fieldIndex,
+                                  MapData mapData, DataType keyType, DataType valueType) {
+        Group mapGroup = parentGroup.addGroup(fieldIndex);
+        ArrayData keys = mapData.keyArray();
+        ArrayData values = mapData.valueArray();
+        for (int j = 0; j < mapData.numElements(); j++) {
+            Group kvGroup = mapGroup.addGroup(0); // "key_value" repeated group
+            writeValueFromArrayData(kvGroup, 0, keys, j, keyType);
+            if (!values.isNullAt(j)) {
+                writeValueFromArrayData(kvGroup, 1, values, j, valueType);
+            }
+        }
+    }
+
+    /**
+     * Write a single value from an ArrayData to a Parquet Group field.
+     * Handles all primitive types and recurses for nested complex types.
+     */
+    private void writeValueFromArrayData(Group group, int fieldIndex,
+                                          ArrayData array, int ordinal, DataType type) {
+        if (type instanceof BooleanType) {
+            group.add(fieldIndex, array.getBoolean(ordinal));
+        } else if (type instanceof ByteType) {
+            group.add(fieldIndex, (int) array.getByte(ordinal));
+        } else if (type instanceof ShortType) {
+            group.add(fieldIndex, (int) array.getShort(ordinal));
+        } else if (type instanceof IntegerType) {
+            group.add(fieldIndex, array.getInt(ordinal));
+        } else if (type instanceof LongType) {
+            group.add(fieldIndex, array.getLong(ordinal));
+        } else if (type instanceof FloatType) {
+            group.add(fieldIndex, array.getFloat(ordinal));
+        } else if (type instanceof DoubleType) {
+            group.add(fieldIndex, array.getDouble(ordinal));
+        } else if (type instanceof StringType) {
+            group.add(fieldIndex, array.getUTF8String(ordinal).toString());
+        } else if (type instanceof BinaryType) {
+            group.add(fieldIndex, Binary.fromReusedByteArray(array.getBinary(ordinal)));
+        } else if (type instanceof DateType) {
+            group.add(fieldIndex, array.getInt(ordinal));
+        } else if (type instanceof TimestampType) {
+            group.add(fieldIndex, array.getLong(ordinal));
+        } else if (type instanceof DecimalType) {
+            DecimalType dt = (DecimalType) type;
+            org.apache.spark.sql.types.Decimal dec = array.getDecimal(ordinal, dt.precision(), dt.scale());
+            if (dt.precision() <= 9) {
+                group.add(fieldIndex, (int) dec.toUnscaledLong());
+            } else if (dt.precision() <= 18) {
+                group.add(fieldIndex, dec.toUnscaledLong());
+            } else {
+                byte[] unscaled = dec.toJavaBigDecimal().unscaledValue().toByteArray();
+                int byteLen = computeDecimalByteLength(dt.precision());
+                byte[] padded = new byte[byteLen];
+                if (unscaled[0] < 0) {
+                    Arrays.fill(padded, (byte) 0xFF);
+                }
+                System.arraycopy(unscaled, 0, padded, padded.length - unscaled.length, unscaled.length);
+                group.add(fieldIndex, Binary.fromConstantByteArray(padded));
+            }
+        } else if (type instanceof ArrayType) {
+            ArrayType at = (ArrayType) type;
+            writeArrayToGroup(group, fieldIndex, array.getArray(ordinal), at.elementType());
+        } else if (type instanceof StructType) {
+            StructType st = (StructType) type;
+            writeStructToGroup(group, fieldIndex, array.getStruct(ordinal, st.fields().length), st);
+        } else if (type instanceof MapType) {
+            MapType mt = (MapType) type;
+            writeMapToGroup(group, fieldIndex, array.getMap(ordinal), mt.keyType(), mt.valueType());
+        } else {
+            group.add(fieldIndex, array.get(ordinal, type).toString());
+        }
     }
 
     // ---------------------------------------------------------------
@@ -310,7 +492,7 @@ public class DuckLakeDataWriter implements DataWriter<InternalRow> {
         @SuppressWarnings({"unchecked", "rawtypes"})
         void addValue(Object value) {
             if (value == null) {
-                // Binary or unsupported type - track count only
+                // Binary, complex, or unsupported type - track count only
                 valueCount++;
                 return;
             }

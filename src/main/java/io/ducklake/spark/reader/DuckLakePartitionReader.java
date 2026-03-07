@@ -2,6 +2,8 @@ package io.ducklake.spark.reader;
 
 import org.apache.spark.sql.catalyst.InternalRow;
 import org.apache.spark.sql.catalyst.expressions.GenericInternalRow;
+import org.apache.spark.sql.catalyst.util.ArrayBasedMapData;
+import org.apache.spark.sql.catalyst.util.GenericArrayData;
 import org.apache.spark.sql.connector.read.PartitionReader;
 import org.apache.spark.sql.types.*;
 import org.apache.spark.unsafe.types.UTF8String;
@@ -289,6 +291,48 @@ public class DuckLakePartitionReader implements PartitionReader<InternalRow> {
                 d.set(new scala.math.BigDecimal(bd), dt.precision(), dt.scale());
                 return d;
             }
+        } else if (sparkType instanceof ArrayType) {
+            ArrayType at = (ArrayType) sparkType;
+            Group listGroup = group.getGroup(fieldIndex, 0);
+            int listSize = listGroup.getFieldRepetitionCount(0); // "list" repeated group count
+            Object[] elements = new Object[listSize];
+            for (int j = 0; j < listSize; j++) {
+                Group elementGroup = listGroup.getGroup(0, j);
+                if (elementGroup.getFieldRepetitionCount(0) == 0) {
+                    elements[j] = null; // null element
+                } else {
+                    elements[j] = readValue(elementGroup, 0, at.elementType());
+                }
+            }
+            return new GenericArrayData(elements);
+        } else if (sparkType instanceof StructType) {
+            StructType st = (StructType) sparkType;
+            Group structGroup = group.getGroup(fieldIndex, 0);
+            Object[] values = new Object[st.fields().length];
+            for (int j = 0; j < st.fields().length; j++) {
+                if (structGroup.getFieldRepetitionCount(j) == 0) {
+                    values[j] = null;
+                } else {
+                    values[j] = readValue(structGroup, j, st.fields()[j].dataType());
+                }
+            }
+            return new GenericInternalRow(values);
+        } else if (sparkType instanceof MapType) {
+            MapType mt = (MapType) sparkType;
+            Group mapGroup = group.getGroup(fieldIndex, 0);
+            int mapSize = mapGroup.getFieldRepetitionCount(0); // "key_value" repeated group count
+            Object[] keys = new Object[mapSize];
+            Object[] values = new Object[mapSize];
+            for (int j = 0; j < mapSize; j++) {
+                Group kvGroup = mapGroup.getGroup(0, j);
+                keys[j] = readValue(kvGroup, 0, mt.keyType());
+                if (kvGroup.getFieldRepetitionCount(1) == 0) {
+                    values[j] = null;
+                } else {
+                    values[j] = readValue(kvGroup, 1, mt.valueType());
+                }
+            }
+            return new ArrayBasedMapData(new GenericArrayData(keys), new GenericArrayData(values));
         } else {
             return UTF8String.fromString(group.getValueToString(fieldIndex, 0));
         }
