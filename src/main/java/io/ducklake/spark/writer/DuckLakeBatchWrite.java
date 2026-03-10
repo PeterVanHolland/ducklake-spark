@@ -3,6 +3,8 @@ package io.ducklake.spark.writer;
 import io.ducklake.spark.catalog.DuckLakeMetadataBackend;
 import io.ducklake.spark.catalog.DuckLakeMetadataBackend.*;
 
+import org.apache.spark.sql.connector.distributions.*;
+import org.apache.spark.sql.connector.expressions.*;
 import org.apache.spark.sql.connector.write.*;
 import org.apache.spark.sql.connector.write.streaming.StreamingWrite;
 import org.apache.spark.sql.types.StructType;
@@ -16,7 +18,7 @@ import java.util.*;
  * Manages the lifecycle of a batch write operation to a DuckLake table.
  * Creates writer factories for executors and commits file metadata to the catalog.
  */
-public class DuckLakeBatchWrite implements Write, BatchWrite {
+public class DuckLakeBatchWrite implements Write, BatchWrite, RequiresDistributionAndOrdering {
 
     private final CaseInsensitiveStringMap options;
     private final StructType schema;
@@ -63,6 +65,26 @@ public class DuckLakeBatchWrite implements Write, BatchWrite {
                 dataPath, tablePath, columnIds);
     }
     @Override
+    public Distribution requiredDistribution() {
+        if (partitionInfos != null && !partitionInfos.isEmpty()) {
+            // Cluster data by partition columns so each writer task gets
+            // rows for a single partition value combination
+            NamedReference[] refs = new NamedReference[partitionInfos.size()];
+            for (int i = 0; i < partitionInfos.size(); i++) {
+                final String colName = partitionInfos.get(i).columnName;
+                refs[i] = Expressions.column(colName);
+            }
+            return Distributions.clustered(refs);
+        }
+        return Distributions.unspecified();
+    }
+
+    @Override
+    public SortOrder[] requiredOrdering() {
+        return new SortOrder[0];
+    }
+
+    @Override
     public DataWriterFactory createBatchWriterFactory(PhysicalWriteInfo info) {
         String writeBasePath = dataPath + tablePath;
         return new DuckLakeDataWriterFactory(schema, columnIds, writeBasePath, tablePath, partitionInfos);
@@ -72,7 +94,16 @@ public class DuckLakeBatchWrite implements Write, BatchWrite {
     public void commit(WriterCommitMessage[] messages) {
         List<DuckLakeWriterCommitMessage> validMessages = new ArrayList<>();
         for (WriterCommitMessage msg : messages) {
-            if (msg != null) {
+            if (msg == null) continue;
+            if (msg instanceof DuckLakePartitionedWriterCommitMessage) {
+                // Partitioned write: unwrap individual partition messages
+                DuckLakePartitionedWriterCommitMessage partMsg = (DuckLakePartitionedWriterCommitMessage) msg;
+                for (DuckLakeWriterCommitMessage pm : partMsg.partitionMessages) {
+                    if (pm.recordCount > 0) {
+                        validMessages.add(pm);
+                    }
+                }
+            } else if (msg instanceof DuckLakeWriterCommitMessage) {
                 DuckLakeWriterCommitMessage dlMsg = (DuckLakeWriterCommitMessage) msg;
                 if (dlMsg.recordCount > 0) {
                     validMessages.add(dlMsg);

@@ -1433,126 +1433,6 @@ public class DuckLakeMetadataBackend implements AutoCloseable {
         }
     }
 
-    // ---------------------------------------------------------------
-    // Partition queries
-    // ---------------------------------------------------------------
-
-    /** Get the active partition_id for a table at a given snapshot, or -1 if unpartitioned. */
-    public long getActivePartitionId(long tableId, long snapshotId) throws SQLException {
-        try (PreparedStatement ps = getConnection().prepareStatement(
-                "SELECT partition_id FROM ducklake_partition_info " +
-                "WHERE table_id = ? AND begin_snapshot <= ? " +
-                "AND (end_snapshot IS NULL OR end_snapshot > ?)")) {
-            ps.setLong(1, tableId);
-            ps.setLong(2, snapshotId);
-            ps.setLong(3, snapshotId);
-            try (ResultSet rs = ps.executeQuery()) {
-                return rs.next() ? rs.getLong(1) : -1;
-            }
-        } catch (SQLException e) {
-            return -1;
-        }
-    }
-
-    /** Get partition columns for a partition_id, ordered by key index. */
-    public List<PartitionColumnDef> getPartitionColumns(long partitionId, long tableId) throws SQLException {
-        List<PartitionColumnDef> result = new ArrayList<>();
-        try (PreparedStatement ps = getConnection().prepareStatement(
-                "SELECT partition_key_index, column_id, transform " +
-                "FROM ducklake_partition_column " +
-                "WHERE partition_id = ? AND table_id = ? " +
-                "ORDER BY partition_key_index")) {
-            ps.setLong(1, partitionId);
-            ps.setLong(2, tableId);
-            try (ResultSet rs = ps.executeQuery()) {
-                while (rs.next()) {
-                    result.add(new PartitionColumnDef(
-                            rs.getInt("partition_key_index"),
-                            rs.getLong("column_id"),
-                            rs.getString("transform")));
-                }
-            }
-        }
-        return result;
-    }
-
-    /** Get file partition values for all data files in a table (for pruning). */
-    public Map<Long, Map<Integer, String>> getFilePartitionValues(long tableId) throws SQLException {
-        Map<Long, Map<Integer, String>> result = new HashMap<>();
-        try (PreparedStatement ps = getConnection().prepareStatement(
-                "SELECT data_file_id, partition_key_index, partition_value " +
-                "FROM ducklake_file_partition_value WHERE table_id = ?")) {
-            ps.setLong(1, tableId);
-            try (ResultSet rs = ps.executeQuery()) {
-                while (rs.next()) {
-                    long dfId = rs.getLong("data_file_id");
-                    int keyIdx = rs.getInt("partition_key_index");
-                    String val = rs.getString("partition_value");
-                    result.computeIfAbsent(dfId, k -> new HashMap<>()).put(keyIdx, val);
-                }
-            }
-        }
-        return result;
-    }
-
-    /** Insert a partition value for a data file. */
-    public void insertFilePartitionValue(long dataFileId, long tableId, int keyIndex, String value) throws SQLException {
-        try (PreparedStatement ps = getConnection().prepareStatement(
-                "INSERT INTO ducklake_file_partition_value (data_file_id, table_id, partition_key_index, partition_value) " +
-                "VALUES (?, ?, ?, ?)")) {
-            ps.setLong(1, dataFileId);
-            ps.setLong(2, tableId);
-            ps.setInt(3, keyIndex);
-            ps.setString(4, value);
-            ps.executeUpdate();
-        }
-    }
-
-    /**
-     * Set identity-transform partitioning on a table.
-     * Creates partition_info and partition_column records in a new snapshot.
-     */
-    public void setPartitionedBy(long tableId, long[] columnIds, int[] keyIndices) throws SQLException {
-        beginTransaction();
-        try {
-            long currentSnap = getCurrentSnapshotId();
-            CatalogState meta = getSnapshotInfo(currentSnap);
-            long newSnap = currentSnap + 1;
-            long partitionId = meta.nextCatalogId;
-
-            createSnapshot(newSnap, meta.schemaVersion + 1, partitionId + 1, meta.nextFileId);
-            insertSnapshotChanges(newSnap, "set_partitioned:" + tableId,
-                    "ducklake-spark", "Set table partitioned");
-
-            try (PreparedStatement ps = getConnection().prepareStatement(
-                    "INSERT INTO ducklake_partition_info (partition_id, table_id, begin_snapshot, end_snapshot) " +
-                    "VALUES (?, ?, ?, NULL)")) {
-                ps.setLong(1, partitionId);
-                ps.setLong(2, tableId);
-                ps.setLong(3, newSnap);
-                ps.executeUpdate();
-            }
-
-            for (int i = 0; i < columnIds.length; i++) {
-                try (PreparedStatement ps = getConnection().prepareStatement(
-                        "INSERT INTO ducklake_partition_column (partition_id, table_id, partition_key_index, column_id, transform) " +
-                        "VALUES (?, ?, ?, ?, NULL)")) {
-                    ps.setLong(1, partitionId);
-                    ps.setLong(2, tableId);
-                    ps.setInt(3, keyIndices[i]);
-                    ps.setLong(4, columnIds[i]);
-                    ps.executeUpdate();
-                }
-            }
-
-            commitTransaction();
-        } catch (Exception e) {
-            rollbackTransaction();
-            throw e instanceof SQLException ? (SQLException) e : new SQLException(e);
-        }
-    }
-
-    // ---------------------------------------------------------------
     // Data classes
     // ---------------------------------------------------------------
 
@@ -1704,18 +1584,6 @@ public class DuckLakeMetadataBackend implements AutoCloseable {
         }
     }
 
-    public static class PartitionColumnDef {
-        public final int keyIndex;
-        public final long columnId;
-        public final String transform;
-
-        public PartitionColumnDef(int keyIndex, long columnId, String transform) {
-            this.keyIndex = keyIndex;
-            this.columnId = columnId;
-            this.transform = transform;
-        }
-    }
-
     public static class EndedFileInfo {
         public final long fileId;
         public final long tableId;
@@ -1735,7 +1603,8 @@ public class DuckLakeMetadataBackend implements AutoCloseable {
         }
     }
 
-    public static class PartitionInfo {
+    public static class PartitionInfo implements java.io.Serializable {
+        private static final long serialVersionUID = 1L;
         public final long columnId;
         public final String columnName;
         public final String partitionExpression;  // null for identity partitions

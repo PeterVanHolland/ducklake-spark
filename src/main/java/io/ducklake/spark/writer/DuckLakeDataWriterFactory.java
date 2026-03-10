@@ -39,6 +39,10 @@ public class DuckLakeDataWriterFactory implements DataWriterFactory, Serializabl
 
     @Override
     public DataWriter<InternalRow> createWriter(int partitionId, long taskAttemptId) {
+        if (partitionInfos != null && !partitionInfos.isEmpty()) {
+            return new DuckLakePartitioningDataWriter(schema, columnIds, writeBasePath,
+                    tablePath, partitionId, taskAttemptId, partitionInfos);
+        }
         return new DuckLakeDataWriter(schema, columnIds, writeBasePath, tablePath,
                 partitionId, taskAttemptId, partitionInfos);
     }
