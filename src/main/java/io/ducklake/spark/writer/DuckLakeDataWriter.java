@@ -26,6 +26,7 @@ import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.ZoneOffset;
 import java.util.*;
+import io.ducklake.spark.catalog.DuckLakeMetadataBackend.PartitionInfo;
 
 /**
  * Writes InternalRow data to a Parquet file and collects column statistics.
@@ -41,17 +42,40 @@ public class DuckLakeDataWriter implements DataWriter<InternalRow> {
     private final SimpleGroupFactory groupFactory;
     private final ParquetWriter<Group> writer;
     private final ColumnStatsAccumulator[] statsAccumulators;
+    private final Map<Integer, Integer> partitionIndexToFieldIndex; // partition index -> field index in schema
+    private final Map<Integer, String> partitionValues; // partition index -> partition value (consistent across all rows)
     private long recordCount = 0;
 
     public DuckLakeDataWriter(StructType schema, long[] columnIds,
                                String writeBasePath, String tablePath,
                                int partitionId, long taskAttemptId) {
+        this(schema, columnIds, writeBasePath, tablePath, partitionId, taskAttemptId, null);
+    }
+
+    public DuckLakeDataWriter(StructType schema, long[] columnIds,
+                               String writeBasePath, String tablePath,
+                               int partitionId, long taskAttemptId,
+                               List<PartitionInfo> partitionInfos) {
         this.schema = schema;
         this.columnIds = columnIds;
 
         String fileName = "ducklake-" + UUID.randomUUID() + ".parquet";
         this.relativePath = tablePath + fileName;
         this.absolutePath = writeBasePath + fileName;
+
+        // Initialize partition tracking
+        this.partitionIndexToFieldIndex = new HashMap<>();
+        this.partitionValues = new HashMap<>();
+        if (partitionInfos != null) {
+            for (PartitionInfo partInfo : partitionInfos) {
+                for (int fieldIndex = 0; fieldIndex < schema.fields().length; fieldIndex++) {
+                    if (schema.fields()[fieldIndex].name().equals(partInfo.columnName)) {
+                        this.partitionIndexToFieldIndex.put(partInfo.partitionIndex, fieldIndex);
+                        break;
+                    }
+                }
+            }
+        }
 
         // Ensure directory exists
         File parentDir = new File(this.absolutePath).getParentFile();
@@ -83,6 +107,34 @@ public class DuckLakeDataWriter implements DataWriter<InternalRow> {
     @Override
     public void write(InternalRow row) throws IOException {
         Group group = groupFactory.newGroup();
+
+        // Extract partition values from this row (should be consistent across all rows in the file)
+        for (Map.Entry<Integer, Integer> entry : partitionIndexToFieldIndex.entrySet()) {
+            int partitionIndex = entry.getKey();
+            int fieldIndex = entry.getValue();
+
+            String partitionValue;
+            if (row.isNullAt(fieldIndex)) {
+                partitionValue = null;
+            } else {
+                DataType fieldType = schema.fields()[fieldIndex].dataType();
+                Object value = extractValue(row, fieldIndex, fieldType);
+                partitionValue = value != null ? value.toString() : null;
+            }
+
+            // Store or validate partition value consistency
+            if (partitionValues.containsKey(partitionIndex)) {
+                String existingValue = partitionValues.get(partitionIndex);
+                if (!Objects.equals(existingValue, partitionValue)) {
+                    throw new IllegalStateException("Inconsistent partition values within a single file: " +
+                            "partition index " + partitionIndex + " has both '" + existingValue +
+                            "' and '" + partitionValue + "'");
+                }
+            } else {
+                partitionValues.put(partitionIndex, partitionValue);
+            }
+        }
+
         for (int i = 0; i < schema.fields().length; i++) {
             DataType type = schema.fields()[i].dataType();
             if (row.isNullAt(i)) {
@@ -114,7 +166,7 @@ public class DuckLakeDataWriter implements DataWriter<InternalRow> {
         }
 
         return new DuckLakeWriterCommitMessage(absolutePath, relativePath,
-                recordCount, fileSize, colStats);
+                recordCount, fileSize, colStats, partitionValues);
     }
 
     @Override
@@ -130,6 +182,37 @@ public class DuckLakeDataWriter implements DataWriter<InternalRow> {
     @Override
     public void close() throws IOException {
         // Called after commit or abort
+    }
+
+    // ---------------------------------------------------------------
+    // Value extraction utilities
+    // ---------------------------------------------------------------
+
+    private Object extractValue(InternalRow row, int fieldIndex, DataType dataType) {
+        if (row.isNullAt(fieldIndex)) {
+            return null;
+        }
+
+        if (dataType instanceof StringType) {
+            return row.getString(fieldIndex);
+        } else if (dataType instanceof IntegerType) {
+            return row.getInt(fieldIndex);
+        } else if (dataType instanceof LongType) {
+            return row.getLong(fieldIndex);
+        } else if (dataType instanceof DoubleType) {
+            return row.getDouble(fieldIndex);
+        } else if (dataType instanceof FloatType) {
+            return row.getFloat(fieldIndex);
+        } else if (dataType instanceof BooleanType) {
+            return row.getBoolean(fieldIndex);
+        } else if (dataType instanceof DateType) {
+            return row.getInt(fieldIndex); // Date stored as days since epoch
+        } else if (dataType instanceof TimestampType) {
+            return row.getLong(fieldIndex); // Timestamp stored as microseconds since epoch
+        } else {
+            // For complex types, use toString
+            return row.get(fieldIndex, dataType);
+        }
     }
 
     // ---------------------------------------------------------------

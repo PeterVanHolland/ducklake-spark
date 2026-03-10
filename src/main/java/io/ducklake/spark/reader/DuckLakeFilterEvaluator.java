@@ -183,6 +183,74 @@ public class DuckLakeFilterEvaluator {
     }
 
     // ---------------------------------------------------------------
+    // Partition-value pruning (static)
+    // ---------------------------------------------------------------
+
+    /**
+     * Check if a filter might match given known partition values for a file.
+     * Only handles filters on partition columns (identity transforms).
+     * Returns true (conservative) if the filter references non-partition columns.
+     */
+    public static boolean partitionMightMatch(Filter filter, Map<String, String> partValuesByColName) {
+        if (filter instanceof EqualTo) {
+            EqualTo f = (EqualTo) filter;
+            String partVal = partValuesByColName.get(f.attribute());
+            if (partVal == null) return true; // not a partition column
+            return compareValues(f.value(), partVal) == 0;
+        } else if (filter instanceof In) {
+            In f = (In) filter;
+            String partVal = partValuesByColName.get(f.attribute());
+            if (partVal == null) return true;
+            for (Object value : f.values()) {
+                if (value != null && compareValues(value, partVal) == 0) {
+                    return true;
+                }
+            }
+            return false;
+        } else if (filter instanceof GreaterThan) {
+            GreaterThan f = (GreaterThan) filter;
+            String partVal = partValuesByColName.get(f.attribute());
+            if (partVal == null) return true;
+            return compareValues(partVal, f.value().toString()) > 0;
+        } else if (filter instanceof GreaterThanOrEqual) {
+            GreaterThanOrEqual f = (GreaterThanOrEqual) filter;
+            String partVal = partValuesByColName.get(f.attribute());
+            if (partVal == null) return true;
+            return compareValues(partVal, f.value().toString()) >= 0;
+        } else if (filter instanceof LessThan) {
+            LessThan f = (LessThan) filter;
+            String partVal = partValuesByColName.get(f.attribute());
+            if (partVal == null) return true;
+            return compareValues(partVal, f.value().toString()) < 0;
+        } else if (filter instanceof LessThanOrEqual) {
+            LessThanOrEqual f = (LessThanOrEqual) filter;
+            String partVal = partValuesByColName.get(f.attribute());
+            if (partVal == null) return true;
+            return compareValues(partVal, f.value().toString()) <= 0;
+        } else if (filter instanceof And) {
+            And and = (And) filter;
+            return partitionMightMatch(and.left(), partValuesByColName)
+                    && partitionMightMatch(and.right(), partValuesByColName);
+        } else if (filter instanceof Or) {
+            Or or = (Or) filter;
+            return partitionMightMatch(or.left(), partValuesByColName)
+                    || partitionMightMatch(or.right(), partValuesByColName);
+        } else if (filter instanceof Not) {
+            // Conservative: can't negate partition pruning safely in general
+            return true;
+        } else if (filter instanceof IsNotNull) {
+            String partVal = partValuesByColName.get(((IsNotNull) filter).attribute());
+            if (partVal == null) return true;
+            return true; // partition values are always non-null for identity
+        } else if (filter instanceof IsNull) {
+            String partVal = partValuesByColName.get(((IsNull) filter).attribute());
+            if (partVal == null) return true;
+            return false; // identity partition values are never null
+        }
+        return true; // conservative
+    }
+
+    // ---------------------------------------------------------------
     // Value comparison
     // ---------------------------------------------------------------
 

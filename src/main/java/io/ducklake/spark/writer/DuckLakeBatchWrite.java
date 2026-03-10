@@ -26,11 +26,20 @@ public class DuckLakeBatchWrite implements Write, BatchWrite {
     private final String tablePath;
     private final long[] columnIds;
     private final boolean isOverwrite;
+    private final List<DuckLakeMetadataBackend.PartitionInfo> partitionInfos;
 
     public DuckLakeBatchWrite(CaseInsensitiveStringMap options, StructType schema,
                                TableInfo tableInfo, List<ColumnInfo> columns,
                                String dataPath, String tablePath,
                                long[] columnIds, boolean isOverwrite) {
+        this(options, schema, tableInfo, columns, dataPath, tablePath, columnIds, isOverwrite, null);
+    }
+
+    public DuckLakeBatchWrite(CaseInsensitiveStringMap options, StructType schema,
+                               TableInfo tableInfo, List<ColumnInfo> columns,
+                               String dataPath, String tablePath,
+                               long[] columnIds, boolean isOverwrite,
+                               List<DuckLakeMetadataBackend.PartitionInfo> partitionInfos) {
         this.options = options;
         this.schema = schema;
         this.tableInfo = tableInfo;
@@ -39,6 +48,7 @@ public class DuckLakeBatchWrite implements Write, BatchWrite {
         this.tablePath = tablePath;
         this.columnIds = columnIds;
         this.isOverwrite = isOverwrite;
+        this.partitionInfos = partitionInfos;
     }
 
     @Override
@@ -55,7 +65,7 @@ public class DuckLakeBatchWrite implements Write, BatchWrite {
     @Override
     public DataWriterFactory createBatchWriterFactory(PhysicalWriteInfo info) {
         String writeBasePath = dataPath + tablePath;
-        return new DuckLakeDataWriterFactory(schema, columnIds, writeBasePath, tablePath);
+        return new DuckLakeDataWriterFactory(schema, columnIds, writeBasePath, tablePath, partitionInfos);
     }
 
     @Override
@@ -109,6 +119,11 @@ public class DuckLakeBatchWrite implements Write, BatchWrite {
                     for (DuckLakeWriterCommitMessage.ColumnStats stats : msg.columnStats) {
                         backend.insertColumnStats(fileId, tableInfo.tableId, stats.columnId,
                                 stats.valueCount, stats.nullCount, stats.minValue, stats.maxValue);
+                    }
+
+                    // Insert partition values if present
+                    if (msg.partitionValues != null && !msg.partitionValues.isEmpty()) {
+                        backend.insertPartitionValues(fileId, tableInfo.tableId, msg.partitionValues);
                     }
 
                     rowIdStart += msg.recordCount;

@@ -62,13 +62,49 @@ public class DuckLakeScan implements Scan, Batch {
             }
 
             String dataPath = backend.getDataPath();
-            List<DataFileInfo> files = backend.getDataFiles(table.tableId, snapshotId);
             List<ColumnInfo> columns = backend.getColumns(table.tableId, snapshotId);
+
+            // Get partition information for partition pruning
+            List<DuckLakeMetadataBackend.PartitionInfo> partitionInfos = backend.getPartitionColumns(table.tableId, snapshotId);
+
+            // Extract partition filters from pushed filters
+            List<DuckLakeMetadataBackend.PartitionFilter> partitionFilters = new ArrayList<>();
+            if (!partitionInfos.isEmpty() && filters != null && filters.length > 0) {
+                DuckLakePartitionFilterExtractor extractor = new DuckLakePartitionFilterExtractor(partitionInfos);
+                partitionFilters = extractor.extractPartitionFilters(filters);
+            }
+
+            // Get data files, using partition pruning if applicable
+            List<DataFileInfo> files;
+            if (!partitionFilters.isEmpty()) {
+                files = backend.getDataFilesForPartition(table.tableId, snapshotId, partitionFilters);
+            } else {
+                files = backend.getDataFiles(table.tableId, snapshotId);
+            }
 
             // Build column ID -> name mapping for stats-based pruning
             Map<Long, String> colIdToName = new HashMap<>();
             for (ColumnInfo col : columns) {
                 colIdToName.put(col.columnId, col.name);
+            }
+
+            // Check if table is partitioned and load partition metadata for pruning
+            long partitionId = backend.getActivePartitionId(table.tableId, snapshotId);
+            List<PartitionColumnDef> partCols = null;
+            Map<Long, Map<Integer, String>> filePartitionValues = null;
+            Map<Integer, String> partKeyToColName = null;
+            if (partitionId >= 0) {
+                partCols = backend.getPartitionColumns(partitionId, table.tableId);
+                if (!partCols.isEmpty()) {
+                    filePartitionValues = backend.getFilePartitionValues(table.tableId);
+                    partKeyToColName = new HashMap<>();
+                    for (PartitionColumnDef pc : partCols) {
+                        String colName = colIdToName.get(pc.columnId);
+                        if (colName != null) {
+                            partKeyToColName.put(pc.keyIndex, colName);
+                        }
+                    }
+                }
             }
 
             // Build schema evolution maps from current columns
@@ -100,6 +136,34 @@ public class DuckLakeScan implements Scan, Batch {
                 Map<Long, String> nameMapping = null;
                 if (file.mappingId >= 0) {
                     nameMapping = backend.getNameMapping(file.mappingId);
+                }
+
+                // Partition-value-based pruning: skip files whose partition values
+                // don't match the pushed filters (identity partitions only)
+                if (partKeyToColName != null && filePartitionValues != null
+                        && filters != null && filters.length > 0) {
+                    Map<Integer, String> fpv = filePartitionValues.get(file.dataFileId);
+                    if (fpv != null) {
+                        Map<String, String> partValuesByColName = new HashMap<>();
+                        for (Map.Entry<Integer, String> entry : fpv.entrySet()) {
+                            String colName = partKeyToColName.get(entry.getKey());
+                            if (colName != null) {
+                                partValuesByColName.put(colName, entry.getValue());
+                            }
+                        }
+                        if (!partValuesByColName.isEmpty()) {
+                            boolean partitionSkip = false;
+                            for (Filter f : filters) {
+                                if (!DuckLakeFilterEvaluator.partitionMightMatch(f, partValuesByColName)) {
+                                    partitionSkip = true;
+                                    break;
+                                }
+                            }
+                            if (partitionSkip) {
+                                continue; // skip this data file
+                            }
+                        }
+                    }
                 }
 
                 // Stats-based file pruning: skip files whose column stats

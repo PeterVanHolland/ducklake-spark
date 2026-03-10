@@ -73,8 +73,12 @@ public class DuckLakeWriteBuilder implements WriteBuilder, SupportsTruncate {
                 }
             }
 
+            // Get partition info if the table is partitioned
+            long snapshotId = backend.getCurrentSnapshotId();
+            List<PartitionInfo> partitionInfos = backend.getPartitionColumns(tableInfo.tableId, snapshotId);
+
             return new DuckLakeBatchWrite(options, schema, tableInfo, columns,
-                    dataPath, tablePath, columnIds, isOverwrite);
+                    dataPath, tablePath, columnIds, isOverwrite, partitionInfos);
         } catch (SQLException e) {
             throw new RuntimeException("Failed to build DuckLake write plan", e);
         }
