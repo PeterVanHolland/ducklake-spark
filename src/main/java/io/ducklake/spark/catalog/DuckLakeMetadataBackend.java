@@ -1275,6 +1275,22 @@ public class DuckLakeMetadataBackend implements AutoCloseable {
      * @return the column_id assigned to the new column
      */
     public long addColumn(long tableId, String columnName, String columnType, boolean nullable) throws SQLException {
+        return addColumnWithDefault(tableId, columnName, columnType, nullable, null, null);
+    }
+
+    /**
+     * Add a column with default values to a table.
+     *
+     * @param tableId The table to add the column to
+     * @param columnName The name of the new column
+     * @param columnType The DuckDB type of the new column
+     * @param nullable Whether the column allows NULL values
+     * @param initialDefault Default value for existing rows when column is added (for schema evolution)
+     * @param writeDefault Default value for new inserts when column value is omitted
+     * @return The column ID of the newly added column
+     */
+    public long addColumnWithDefault(long tableId, String columnName, String columnType, boolean nullable,
+                                   String initialDefault, String writeDefault) throws SQLException {
         beginTransaction();
         try {
             long currentSnap = getCurrentSnapshotId();
@@ -1283,7 +1299,8 @@ public class DuckLakeMetadataBackend implements AutoCloseable {
             long columnId = meta.nextCatalogId;
 
             createSnapshot(newSnap, meta.schemaVersion + 1, columnId + 1, meta.nextFileId);
-            insertSnapshotChanges(newSnap, "added_column:\"" + columnName + "\"",
+            insertSnapshotChanges(newSnap, "added_column:\"" + columnName + "\"" +
+                    (initialDefault != null || writeDefault != null ? " with defaults" : ""),
                     "ducklake-spark", "Add column " + columnName);
 
             // Determine column_order: max existing order + 1
@@ -1303,14 +1320,16 @@ public class DuckLakeMetadataBackend implements AutoCloseable {
                     "INSERT INTO ducklake_column (column_id, begin_snapshot, end_snapshot, table_id, " +
                     "column_order, column_name, column_type, initial_default, default_value, " +
                     "nulls_allowed, parent_column, default_value_type, default_value_dialect) " +
-                    "VALUES (?, ?, NULL, ?, ?, ?, ?, NULL, NULL, ?, NULL, NULL, NULL)")) {
+                    "VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL)")) {
                 ps.setLong(1, columnId);
                 ps.setLong(2, newSnap);
                 ps.setLong(3, tableId);
                 ps.setInt(4, colOrder);
                 ps.setString(5, columnName);
                 ps.setString(6, columnType);
-                ps.setInt(7, nullable ? 1 : 0);
+                ps.setString(7, initialDefault);
+                ps.setString(8, writeDefault);
+                ps.setInt(9, nullable ? 1 : 0);
                 ps.executeUpdate();
             }
 
@@ -1521,6 +1540,162 @@ public class DuckLakeMetadataBackend implements AutoCloseable {
         }
     }
 
+    // ---------------------------------------------------------------
+    // Constraints
+    // ---------------------------------------------------------------
+
+    /**
+     * Get all constraints for a table at a specific snapshot.
+     *
+     * @param tableId The table ID
+     * @param snapshotId The snapshot ID (use -1 for current)
+     * @return List of table constraints
+     * @throws SQLException on database error
+     */
+    public List<ConstraintInfo> getConstraints(long tableId, long snapshotId) throws SQLException {
+        List<ConstraintInfo> result = new ArrayList<>();
+        long actualSnapshot = snapshotId == -1 ? getCurrentSnapshotId() : snapshotId;
+
+        // Check if ducklake_table_constraint table exists, create if not
+        ensureConstraintTableExists();
+
+        try (PreparedStatement ps = getConnection().prepareStatement(
+                "SELECT constraint_type, column_names, constraint_name " +
+                "FROM ducklake_table_constraint " +
+                "WHERE table_id = ? AND begin_snapshot <= ? AND (end_snapshot IS NULL OR end_snapshot > ?) " +
+                "ORDER BY constraint_name")) {
+            ps.setLong(1, tableId);
+            ps.setLong(2, actualSnapshot);
+            ps.setLong(3, actualSnapshot);
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    String constraintType = rs.getString("constraint_type");
+                    String columnNamesStr = rs.getString("column_names");
+                    String constraintName = rs.getString("constraint_name");
+
+                    // Parse column names (comma-separated)
+                    String[] columnNames = columnNamesStr != null ? columnNamesStr.split(",") : new String[0];
+                    for (int i = 0; i < columnNames.length; i++) {
+                        columnNames[i] = columnNames[i].trim();
+                    }
+
+                    result.add(new ConstraintInfo(constraintName, constraintType, columnNames));
+                }
+            }
+        }
+        return result;
+    }
+
+    /**
+     * Get all constraints for a table (at current snapshot).
+     *
+     * @param tableId The table ID
+     * @return List of table constraints
+     * @throws SQLException on database error
+     */
+    public List<ConstraintInfo> getConstraints(long tableId) throws SQLException {
+        return getConstraints(tableId, -1);
+    }
+
+    /**
+     * Add a constraint to a table.
+     *
+     * @param tableId The table ID
+     * @param constraintName The name of the constraint
+     * @param constraintType The type of constraint (NOT NULL, UNIQUE, CHECK)
+     * @param columnNames The columns the constraint applies to
+     * @throws SQLException on database error
+     */
+    public void addConstraint(long tableId, String constraintName, String constraintType, String[] columnNames) throws SQLException {
+        ensureConstraintTableExists();
+
+        beginTransaction();
+        try {
+            long currentSnap = getCurrentSnapshotId();
+            CatalogState meta = getSnapshotInfo(currentSnap);
+            long newSnap = currentSnap + 1;
+
+            createSnapshot(newSnap, meta.schemaVersion + 1, meta.nextCatalogId, meta.nextFileId);
+            insertSnapshotChanges(newSnap, "added_constraint:\"" + constraintName + "\"",
+                    "ducklake-spark", "Add constraint " + constraintName);
+
+            // Join column names with comma
+            String columnNamesStr = String.join(",", columnNames);
+
+            try (PreparedStatement ps = getConnection().prepareStatement(
+                    "INSERT INTO ducklake_table_constraint (table_id, begin_snapshot, end_snapshot, " +
+                    "constraint_name, constraint_type, column_names) " +
+                    "VALUES (?, ?, NULL, ?, ?, ?)")) {
+                ps.setLong(1, tableId);
+                ps.setLong(2, newSnap);
+                ps.setString(3, constraintName);
+                ps.setString(4, constraintType);
+                ps.setString(5, columnNamesStr);
+                ps.executeUpdate();
+            }
+
+            commitTransaction();
+        } catch (Exception e) {
+            rollbackTransaction();
+            throw e instanceof SQLException ? (SQLException) e : new SQLException(e);
+        }
+    }
+
+    /**
+     * Drop a constraint from a table.
+     *
+     * @param tableId The table ID
+     * @param constraintName The name of the constraint to drop
+     * @throws SQLException on database error
+     */
+    public void dropConstraint(long tableId, String constraintName) throws SQLException {
+        ensureConstraintTableExists();
+
+        beginTransaction();
+        try {
+            long currentSnap = getCurrentSnapshotId();
+            CatalogState meta = getSnapshotInfo(currentSnap);
+            long newSnap = currentSnap + 1;
+
+            createSnapshot(newSnap, meta.schemaVersion + 1, meta.nextCatalogId, meta.nextFileId);
+            insertSnapshotChanges(newSnap, "dropped_constraint:\"" + constraintName + "\"",
+                    "ducklake-spark", "Drop constraint " + constraintName);
+
+            try (PreparedStatement ps = getConnection().prepareStatement(
+                    "UPDATE ducklake_table_constraint SET end_snapshot = ? " +
+                    "WHERE table_id = ? AND constraint_name = ? AND end_snapshot IS NULL")) {
+                ps.setLong(1, newSnap);
+                ps.setLong(2, tableId);
+                ps.setString(3, constraintName);
+                int updated = ps.executeUpdate();
+                if (updated == 0) {
+                    throw new SQLException("Constraint not found: " + constraintName);
+                }
+            }
+
+            commitTransaction();
+        } catch (Exception e) {
+            rollbackTransaction();
+            throw e instanceof SQLException ? (SQLException) e : new SQLException(e);
+        }
+    }
+
+    /**
+     * Ensure the ducklake_table_constraint table exists.
+     */
+    private void ensureConstraintTableExists() throws SQLException {
+        try (Statement st = getConnection().createStatement()) {
+            st.execute("CREATE TABLE IF NOT EXISTS ducklake_table_constraint(" +
+                    "table_id BIGINT, " +
+                    "begin_snapshot BIGINT, " +
+                    "end_snapshot BIGINT, " +
+                    "constraint_name VARCHAR, " +
+                    "constraint_type VARCHAR, " +
+                    "column_names VARCHAR)");
+        }
+    }
+
+    // ---------------------------------------------------------------
     // Data classes
     // ---------------------------------------------------------------
 
@@ -1587,6 +1762,18 @@ public class DuckLakeMetadataBackend implements AutoCloseable {
             this.defaultValue = defaultValue;
             this.nullable = nullable;
             this.parentColumn = parentColumn;
+        }
+    }
+
+    public static class ConstraintInfo {
+        public final String name;
+        public final String type;
+        public final String[] columnNames;
+
+        public ConstraintInfo(String name, String type, String[] columnNames) {
+            this.name = name;
+            this.type = type;
+            this.columnNames = columnNames;
         }
     }
 

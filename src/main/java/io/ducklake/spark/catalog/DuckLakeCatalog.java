@@ -174,7 +174,12 @@ public class DuckLakeCatalog implements CatalogPlugin, TableCatalog, SupportsNam
                     String colName = fieldNames[fieldNames.length - 1];
                     String colType = DuckLakeTypeMapping.toDuckDBType(add.dataType());
                     boolean nullable = add.isNullable();
-                    backend.addColumn(tableInfo.tableId, colName, colType, nullable);
+
+                    // TODO: Extract default values from table properties or metadata when Spark supports it
+                    String initialDefault = null;
+                    String writeDefault = null;
+
+                    backend.addColumnWithDefault(tableInfo.tableId, colName, colType, nullable, initialDefault, writeDefault);
                 } else if (change instanceof TableChange.DeleteColumn) {
                     TableChange.DeleteColumn del = (TableChange.DeleteColumn) change;
                     String[] fieldNames = del.fieldNames();
