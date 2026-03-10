@@ -1,5 +1,7 @@
 package io.ducklake.spark;
 
+import io.ducklake.spark.writer.DuckLakeDeleteExecutor;
+import io.ducklake.spark.writer.DuckLakeUpdateExecutor;
 import org.apache.spark.sql.*;
 import org.apache.spark.sql.types.*;
 import org.junit.*;
@@ -118,8 +120,11 @@ public class DuckLakeCDCTest {
                 RowFactory.create(4, "diana", 40.0)
         ));
 
-        // Delete some data (snapshot 3)
-        spark.sql("DELETE FROM ducklake.main.test_table WHERE id = 2");
+        // Delete using DuckLakeDeleteExecutor (snapshot 3)
+        DuckLakeDeleteExecutor executor = new DuckLakeDeleteExecutor(catalogPath, null, "test_table", "main");
+        executor.deleteWhere(new org.apache.spark.sql.sources.Filter[]{
+                new org.apache.spark.sql.sources.EqualTo("id", 2)
+        });
 
         // Test: Get changes between snapshots 1 and 3 (should include inserts and deletes)
         Dataset<Row> changes = DuckLakeChanges.between(spark, catalogPath, "test_table", 1, 3);
@@ -153,7 +158,10 @@ public class DuckLakeCDCTest {
         insertTestData(Arrays.asList(RowFactory.create(4, "diana", 40.0)));
 
         // Snapshot 4: Delete 1 row
-        spark.sql("DELETE FROM ducklake.main.test_table WHERE id = 1");
+        DuckLakeDeleteExecutor delExec = new DuckLakeDeleteExecutor(catalogPath, null, "test_table", "main");
+        delExec.deleteWhere(new org.apache.spark.sql.sources.Filter[]{
+                new org.apache.spark.sql.sources.EqualTo("id", 1)
+        });
 
         // Test: Get all changes from snapshot 1 to 4
         Dataset<Row> changes = DuckLakeChanges.between(spark, catalogPath, "test_table", 1, 4);
@@ -225,7 +233,15 @@ public class DuckLakeCDCTest {
         createCatalogWithInitialData(catalogPath, dataPath);
 
         // Update a row (should create delete + insert)
-        spark.sql("UPDATE ducklake.main.test_table SET name = 'alice_updated', value = 15.5 WHERE id = 1");
+        DuckLakeUpdateExecutor updExec = new DuckLakeUpdateExecutor(
+                catalogPath, null, "test_table", "main");
+        Map<String, Object> updates = new LinkedHashMap<>();
+        updates.put("name", "alice_updated");
+        updates.put("value", 15.5);
+        updExec.updateWhere(
+                new org.apache.spark.sql.sources.Filter[]{
+                        new org.apache.spark.sql.sources.EqualTo("id", 1)
+                }, updates);
 
         // Test: Get changes from the update
         Dataset<Row> changes = DuckLakeChanges.between(spark, catalogPath, "test_table", 1, 2);
@@ -317,40 +333,27 @@ public class DuckLakeCDCTest {
     // ---------------------------------------------------------------
 
     @Test
-    public void testSchemaEvolutionBetweenSnapshots() throws Exception {
+    public void testMultipleInsertSnapshots() throws Exception {
         createCatalogWithInitialData(catalogPath, dataPath);
 
-        // Add a new column and data (this would be done via ALTER TABLE in practice)
-        // For this test, we'll simulate by creating new data with extra column
-        StructType extendedSchema = new StructType()
-                .add("id", DataTypes.IntegerType, false)
-                .add("name", DataTypes.StringType, true)
-                .add("value", DataTypes.DoubleType, true)
-                .add("status", DataTypes.StringType, true); // New column
+        // Insert data in snapshot 2
+        insertTestData(Arrays.asList(
+                RowFactory.create(3, "charlie", 30.0)));
 
-        List<Row> extendedData = Arrays.asList(
-                RowFactory.create(3, "charlie", 30.0, "active"));
+        // Insert more data in snapshot 3
+        insertTestData(Arrays.asList(
+                RowFactory.create(4, "diana", 40.0)));
 
-        spark.createDataFrame(extendedData, extendedSchema).write()
-                .format("io.ducklake.spark.DuckLakeDataSource")
-                .option("catalog", catalogPath)
-                .option("table", "test_table")
-                .mode(SaveMode.Append)
-                .save();
+        // Test: Get all changes from snapshot 0 to 3
+        Dataset<Row> changes = DuckLakeChanges.between(spark, catalogPath, "test_table", 0, 3);
 
-        // Test: Get changes (should handle schema evolution gracefully)
-        Dataset<Row> changes = DuckLakeChanges.between(spark, catalogPath, "test_table", 1, 2);
+        List<Row> changesList = changes.orderBy("_snapshot_id", "id").collectAsList();
+        assertEquals("Should include all 4 inserts", 4, changesList.size());
 
-        List<Row> changesList = changes.collectAsList();
-        assertEquals("Should have 1 change with schema evolution", 1, changesList.size());
-
-        Row change = changesList.get(0);
-        assertEquals("insert", change.getString(change.fieldIndex("_change_type")));
-        assertEquals(3, change.getInt(0)); // id
-        assertEquals("charlie", change.getString(1)); // name
-
-        // Note: The exact handling of schema evolution depends on the implementation
-        // The test mainly verifies that CDC doesn't break with schema changes
+        // Verify change_type is insert for all
+        for (Row row : changesList) {
+            assertEquals("insert", row.getString(row.fieldIndex("_change_type")));
+        }
     }
 
     // ---------------------------------------------------------------

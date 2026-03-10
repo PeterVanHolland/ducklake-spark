@@ -13,6 +13,7 @@ import org.apache.spark.sql.types.*;
 import java.nio.file.Paths;
 import java.sql.SQLException;
 import java.util.*;
+import java.util.stream.*;
 
 /**
  * CDC (Change Data Capture) utility for DuckLake tables.
@@ -159,23 +160,46 @@ public class DuckLakeChanges {
             }
         }
 
-        // Get deleted data (from delete files added in the range)
+        // Get deleted data: read delete files to get row IDs, then resolve them
+        // against the original data files to get the full deleted rows.
         List<DeleteFileInfo> deletedFiles = backend.getDeleteFilesInRange(table.tableId, fromSnapshot, toSnapshot);
-        for (DeleteFileInfo fileInfo : deletedFiles) {
-            String filePath = resolveFilePath(dataPath, fileInfo.path, fileInfo.pathIsRelative);
+        for (DeleteFileInfo deleteFileInfo : deletedFiles) {
+            String deleteFilePath = resolveFilePath(dataPath, deleteFileInfo.path, deleteFileInfo.pathIsRelative);
 
             try {
-                Dataset<Row> fileData = spark.read().parquet(filePath);
+                // Read the delete file to get file-local row positions
+                Dataset<Row> deleteRows = spark.read().parquet(deleteFilePath);
+                Set<Long> deletedPositions = new HashSet<>();
+                for (Row r : deleteRows.collectAsList()) {
+                    deletedPositions.add(r.getLong(0)); // row_id = file-local position
+                }
 
-                // Add CDC metadata columns
-                Dataset<Row> deleteChanges = fileData
-                        .withColumn("_change_type", functions.lit("delete"))
-                        .withColumn("_snapshot_id", functions.lit(fileInfo.beginSnapshot));
+                if (deletedPositions.isEmpty()) continue;
 
-                changeSets.add(deleteChanges);
+                // Find the original data file for these deletes
+                DataFileInfo originalFile = backend.getDataFileById(deleteFileInfo.dataFileId);
+                if (originalFile == null) continue;
+
+                String origFilePath = resolveFilePath(dataPath, originalFile.path, originalFile.pathIsRelative);
+                Dataset<Row> origData = spark.read().parquet(origFilePath);
+
+                // Filter to the deleted rows by file-local position (0-based index)
+                List<Row> origRows = origData.collectAsList();
+                List<Row> deletedData = new ArrayList<>();
+                for (int i = 0; i < origRows.size(); i++) {
+                    if (deletedPositions.contains((long) i)) {
+                        deletedData.add(origRows.get(i));
+                    }
+                }
+
+                if (!deletedData.isEmpty()) {
+                    Dataset<Row> deletedDf = spark.createDataFrame(deletedData, origData.schema())
+                            .withColumn("_change_type", functions.lit("delete"))
+                            .withColumn("_snapshot_id", functions.lit(deleteFileInfo.beginSnapshot));
+                    changeSets.add(deletedDf);
+                }
             } catch (Exception e) {
-                // Log warning but continue - file might be compacted or deleted
-                System.err.println("Warning: Could not read delete file " + filePath + ": " + e.getMessage());
+                System.err.println("Warning: Could not resolve deleted rows from " + deleteFilePath + ": " + e.getMessage());
             }
         }
 
