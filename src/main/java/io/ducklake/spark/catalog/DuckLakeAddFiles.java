@@ -103,10 +103,10 @@ public class DuckLakeAddFiles {
             backend.commitTransaction();
             return newSnap;
         } catch (Exception e) {
-            backend.rollbackTransaction();
-            throw e instanceof SQLException ? (SQLException) e :
-                  e instanceof IOException ? (IOException) e :
-                  new SQLException(e);
+            try { backend.rollbackTransaction(); } catch (SQLException rollbackEx) { /* ignore */ }
+            if (e instanceof SQLException) throw (SQLException) e;
+            if (e instanceof IOException) throw (IOException) e;
+            throw new SQLException(e);
         }
     }
 
