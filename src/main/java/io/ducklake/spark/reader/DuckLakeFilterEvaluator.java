@@ -57,6 +57,8 @@ public class DuckLakeFilterEvaluator {
         } else if (filter instanceof Or) {
             Or or = (Or) filter;
             return mightMatch(or.left()) || mightMatch(or.right());
+        } else if (filter instanceof StringStartsWith) {
+            return evalStringStartsWith((StringStartsWith) filter);
         } else if (filter instanceof Not) {
             Not not = (Not) filter;
             Filter child = not.child();
@@ -182,18 +184,90 @@ public class DuckLakeFilterEvaluator {
         return stats.valueCount > 0;
     }
 
+    private boolean evalStringStartsWith(StringStartsWith f) {
+        FileColumnStats stats = statsMap.get(f.attribute());
+        if (stats == null || stats.minValue == null || stats.maxValue == null) {
+            return true;
+        }
+        if (stats.valueCount == 0) {
+            return false;
+        }
+        String prefix = f.value().toString();
+        // File can be skipped if max < prefix or min starts-after prefix range
+        // Conservative: if max < prefix, no values can match
+        if (stats.maxValue.compareTo(prefix) < 0) {
+            return false;
+        }
+        // If min starts after the prefix range (prefix + max char), skip
+        String prefixEnd = prefix.substring(0, prefix.length() - 1) +
+                (char) (prefix.charAt(prefix.length() - 1) + 1);
+        if (stats.minValue.compareTo(prefixEnd) >= 0) {
+            return false;
+        }
+        return true;
+    }
+
     // ---------------------------------------------------------------
     // Value comparison
     // ---------------------------------------------------------------
 
     /**
      * Compare a filter literal against a stat value (stored as String).
-     * Tries numeric comparison first; falls back to lexicographic.
+     * Handles numeric, date, timestamp, and string comparisons.
+     *
+     * Type dispatch order:
+     *   1. Boolean values (true=1, false=0)
+     *   2. Integer types (byte, short, int, long)
+     *   3. Floating point (float, double)
+     *   4. BigDecimal
+     *   5. Date (epoch days → ISO string)
+     *   6. Timestamp (epoch micros → ISO string)
+     *   7. Numeric string fallback (parseDouble)
+     *   8. Lexicographic string comparison
      */
     static int compareValues(Object filterValue, String statValue) {
         if (filterValue == null || statValue == null) {
             return 0; // conservative
         }
+
+        // Handle typed filter values directly
+        if (filterValue instanceof Boolean) {
+            String fStr = ((Boolean) filterValue) ? "1" : "0";
+            return fStr.compareTo(statValue);
+        }
+
+        if (filterValue instanceof Integer || filterValue instanceof Long ||
+            filterValue instanceof Short || filterValue instanceof Byte) {
+            try {
+                long fv = ((Number) filterValue).longValue();
+                long sv = Long.parseLong(statValue);
+                return Long.compare(fv, sv);
+            } catch (NumberFormatException e) {
+                // fall through
+            }
+        }
+
+        if (filterValue instanceof Float || filterValue instanceof Double) {
+            try {
+                double fv = ((Number) filterValue).doubleValue();
+                double sv = Double.parseDouble(statValue);
+                return Double.compare(fv, sv);
+            } catch (NumberFormatException e) {
+                // fall through
+            }
+        }
+
+        if (filterValue instanceof java.math.BigDecimal) {
+            try {
+                java.math.BigDecimal fv = (java.math.BigDecimal) filterValue;
+                java.math.BigDecimal sv = new java.math.BigDecimal(statValue);
+                return fv.compareTo(sv);
+            } catch (NumberFormatException e) {
+                // fall through
+            }
+        }
+
+        // String fallback: try numeric, then lexicographic
         String filterStr = filterValue.toString();
         try {
             double fv = Double.parseDouble(filterStr);
