@@ -5,8 +5,21 @@ import java.util.*;
 import java.util.ConcurrentModificationException;
 
 /**
- * Reads DuckLake catalog metadata from a SQL database (SQLite or PostgreSQL).
+ * Reads DuckLake catalog metadata from a SQL database (SQLite, DuckDB, or PostgreSQL).
  * This is the core abstraction over the DuckLake metadata schema.
+ *
+ * <p>Backend detection logic (matches ducklake-dataframe reference implementation):</p>
+ * <ul>
+ *   <li><b>PostgreSQL</b>: path starts with {@code postgresql://}, {@code postgres://},
+ *       or {@code jdbc:postgresql:}</li>
+ *   <li><b>DuckDB</b>: path ends with {@code .duckdb}, starts with {@code duckdb:},
+ *       or starts with {@code jdbc:duckdb:}</li>
+ *   <li><b>SQLite</b>: everything else (default)</li>
+ * </ul>
+ *
+ * <p>DuckDB requires the DuckDB JDBC driver ({@code org.duckdb:duckdb_jdbc}) on the
+ * classpath at runtime. When using Spark, add it via {@code --jars} or
+ * {@code spark.jars.packages}.</p>
  */
 public class DuckLakeMetadataBackend implements AutoCloseable {
     private final String jdbcUrl;
@@ -14,8 +27,19 @@ public class DuckLakeMetadataBackend implements AutoCloseable {
     private Connection connection;
 
     public DuckLakeMetadataBackend(String catalogPath, String dataPath) {
-        if (catalogPath.startsWith("postgresql://") || catalogPath.startsWith("jdbc:postgresql:")) {
+        if (catalogPath.startsWith("postgresql://") || catalogPath.startsWith("postgres://")
+                || catalogPath.startsWith("jdbc:postgresql:")) {
             this.jdbcUrl = catalogPath.startsWith("jdbc:") ? catalogPath : "jdbc:" + catalogPath;
+        } else if (catalogPath.endsWith(".duckdb") || catalogPath.startsWith("duckdb:")
+                || catalogPath.startsWith("jdbc:duckdb:")) {
+            // DuckDB backend
+            if (catalogPath.startsWith("jdbc:duckdb:")) {
+                this.jdbcUrl = catalogPath;
+            } else if (catalogPath.startsWith("duckdb:")) {
+                this.jdbcUrl = "jdbc:duckdb:" + catalogPath.substring("duckdb:".length());
+            } else {
+                this.jdbcUrl = "jdbc:duckdb:" + catalogPath;
+            }
         } else {
             // SQLite (default)
             this.jdbcUrl = "jdbc:sqlite:" + catalogPath;
@@ -40,6 +64,28 @@ public class DuckLakeMetadataBackend implements AutoCloseable {
     public void close() throws SQLException {
         if (connection != null && !connection.isClosed()) {
             connection.close();
+        }
+    }
+
+
+    /**
+     * Read a boolean column from a ResultSet in a way that works across
+     * SQLite (stores as 0/1 INTEGER) and DuckDB (stores as BOOLEAN).
+     */
+    private static boolean getBooleanCompat(ResultSet rs, String column) throws SQLException {
+        try {
+            return rs.getBoolean(column);
+        } catch (SQLException e) {
+            // Fallback for drivers that don't support getBoolean on integer columns
+            return rs.getInt(column) == 1;
+        }
+    }
+
+    private static boolean getBooleanCompat(ResultSet rs, int columnIndex) throws SQLException {
+        try {
+            return rs.getBoolean(columnIndex);
+        } catch (SQLException e) {
+            return rs.getInt(columnIndex) == 1;
         }
     }
 
@@ -196,7 +242,7 @@ public class DuckLakeMetadataBackend implements AutoCloseable {
                             rs.getLong("schema_id"),
                             rs.getString("schema_name"),
                             rs.getString("path"),
-                            rs.getInt("path_is_relative") == 1));
+                            getBooleanCompat(rs, "path_is_relative")));
                 }
             }
         }
@@ -225,7 +271,7 @@ public class DuckLakeMetadataBackend implements AutoCloseable {
                             rs.getString("table_uuid"),
                             rs.getString("table_name"),
                             rs.getString("path"),
-                            rs.getInt("path_is_relative") == 1));
+                            getBooleanCompat(rs, "path_is_relative")));
                 }
             }
         }
@@ -251,7 +297,7 @@ public class DuckLakeMetadataBackend implements AutoCloseable {
                             rs.getString("table_uuid"),
                             rs.getString("table_name"),
                             rs.getString("path"),
-                            rs.getInt("path_is_relative") == 1);
+                            getBooleanCompat(rs, "path_is_relative"));
                 }
             }
         }
@@ -290,7 +336,7 @@ public class DuckLakeMetadataBackend implements AutoCloseable {
                             rs.getString("table_uuid"),
                             rs.getString("table_name"),
                             rs.getString("path"),
-                            rs.getInt("path_is_relative") == 1);
+                            getBooleanCompat(rs, "path_is_relative"));
                 }
             }
         }
@@ -328,7 +374,7 @@ public class DuckLakeMetadataBackend implements AutoCloseable {
                             rs.getInt("column_order"),
                             rs.getString("initial_default"),
                             rs.getString("default_value"),
-                            rs.getInt("nulls_allowed") == 1,
+                            getBooleanCompat(rs, "nulls_allowed"),
                             rs.getObject("parent_column") == null ? -1 : rs.getLong("parent_column")));
                 }
             }
@@ -363,7 +409,7 @@ public class DuckLakeMetadataBackend implements AutoCloseable {
                     result.add(new DataFileInfo(
                             rs.getLong("data_file_id"),
                             rs.getString("path"),
-                            rs.getInt("path_is_relative") == 1,
+                            getBooleanCompat(rs, "path_is_relative"),
                             rs.getString("file_format"),
                             rs.getLong("record_count"),
                             rs.getLong("file_size_bytes"),
@@ -397,7 +443,7 @@ public class DuckLakeMetadataBackend implements AutoCloseable {
                     result.add(new DeleteFileInfo(
                             rs.getLong("delete_file_id"),
                             rs.getString("path"),
-                            rs.getInt("path_is_relative") == 1,
+                            getBooleanCompat(rs, "path_is_relative"),
                             rs.getString("format"),
                             rs.getLong("delete_count")));
                 }
@@ -423,7 +469,7 @@ public class DuckLakeMetadataBackend implements AutoCloseable {
                     result.add(new DataFileInfo(
                             rs.getLong("data_file_id"),
                             rs.getString("path"),
-                            rs.getInt("path_is_relative") == 1,
+                            getBooleanCompat(rs, "path_is_relative"),
                             rs.getString("file_format"),
                             rs.getLong("record_count"),
                             rs.getLong("file_size_bytes"),
@@ -453,7 +499,7 @@ public class DuckLakeMetadataBackend implements AutoCloseable {
                             rs.getLong("delete_file_id"),
                             rs.getLong("data_file_id"),
                             rs.getString("path"),
-                            rs.getInt("path_is_relative") == 1,
+                            getBooleanCompat(rs, "path_is_relative"),
                             rs.getString("format"),
                             rs.getLong("delete_count"),
                             rs.getLong("begin_snapshot")));
@@ -474,7 +520,7 @@ public class DuckLakeMetadataBackend implements AutoCloseable {
             try (ResultSet rs = ps.executeQuery()) {
                 if (rs.next()) {
                     return new DataFileInfo(
-                            rs.getLong(1), rs.getString(2), rs.getInt(3) == 1,
+                            rs.getLong(1), rs.getString(2), getBooleanCompat(rs, 3),
                             rs.getString(4), rs.getLong(5), rs.getLong(6),
                             rs.getLong(7), rs.getLong(8), rs.getLong(9), rs.getLong(10));
                 }
@@ -826,11 +872,12 @@ public class DuckLakeMetadataBackend implements AutoCloseable {
     /** Create a new snapshot record. */
     public void createSnapshot(long snapshotId, long schemaVersion, long nextCatalogId, long nextFileId) throws SQLException {
         try (PreparedStatement ps = getConnection().prepareStatement(
-                "INSERT INTO ducklake_snapshot (snapshot_id, snapshot_time, schema_version, next_catalog_id, next_file_id) VALUES (?, datetime('now'), ?, ?, ?)")) {
+                "INSERT INTO ducklake_snapshot (snapshot_id, snapshot_time, schema_version, next_catalog_id, next_file_id) VALUES (?, ?, ?, ?, ?)")) {
             ps.setLong(1, snapshotId);
-            ps.setLong(2, schemaVersion);
-            ps.setLong(3, nextCatalogId);
-            ps.setLong(4, nextFileId);
+            ps.setString(2, java.time.LocalDateTime.now(java.time.ZoneOffset.UTC).toString());
+            ps.setLong(3, schemaVersion);
+            ps.setLong(4, nextCatalogId);
+            ps.setLong(5, nextFileId);
             ps.executeUpdate();
         }
     }
@@ -1044,7 +1091,7 @@ public class DuckLakeMetadataBackend implements AutoCloseable {
                         rs.getLong("begin_snapshot"),
                         rs.getLong("end_snapshot"),
                         rs.getString("path"),
-                        rs.getInt("path_is_relative") == 1));
+                        getBooleanCompat(rs, "path_is_relative")));
             }
         }
         return result;
@@ -1064,7 +1111,7 @@ public class DuckLakeMetadataBackend implements AutoCloseable {
                         rs.getLong("begin_snapshot"),
                         rs.getLong("end_snapshot"),
                         rs.getString("path"),
-                        rs.getInt("path_is_relative") == 1));
+                        getBooleanCompat(rs, "path_is_relative")));
             }
         }
         return result;
@@ -1118,7 +1165,7 @@ public class DuckLakeMetadataBackend implements AutoCloseable {
                             rs.getLong("schema_id"),
                             rs.getString("schema_name"),
                             rs.getString("path"),
-                            rs.getInt("path_is_relative") == 1);
+                            getBooleanCompat(rs, "path_is_relative"));
                 }
             }
         }
@@ -1463,7 +1510,7 @@ public class DuckLakeMetadataBackend implements AutoCloseable {
                     columnId = rs.getLong("column_id");
                     colType = rs.getString("column_type");
                     colOrder = rs.getInt("column_order");
-                    nullable = rs.getInt("nulls_allowed") == 1;
+                    nullable = getBooleanCompat(rs, "nulls_allowed");
                     initialDefault = rs.getString("initial_default");
                     defaultValue = rs.getString("default_value");
                 }
@@ -1548,7 +1595,7 @@ public class DuckLakeMetadataBackend implements AutoCloseable {
                     }
                     columnId = rs.getLong("column_id");
                     colOrder = rs.getInt("column_order");
-                    nullable = rs.getInt("nulls_allowed") == 1;
+                    nullable = getBooleanCompat(rs, "nulls_allowed");
                     initialDefault = rs.getString("initial_default");
                 }
             }
