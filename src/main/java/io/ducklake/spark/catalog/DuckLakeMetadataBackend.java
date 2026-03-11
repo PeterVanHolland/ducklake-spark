@@ -2,7 +2,7 @@ package io.ducklake.spark.catalog;
 
 import java.sql.*;
 import java.util.*;
-import java.util.concurrent.ConcurrentModificationException;
+import java.util.ConcurrentModificationException;
 
 /**
  * Reads DuckLake catalog metadata from a SQL database (SQLite or PostgreSQL).
@@ -843,14 +843,14 @@ public class DuckLakeMetadataBackend implements AutoCloseable {
      * @param schemaVersion Schema version for the new snapshot
      * @param nextCatalogId Next catalog ID for the new snapshot
      * @param nextFileId Next file ID for the new snapshot
-     * @throws java.util.concurrent.ConcurrentModificationException if the expected current snapshot doesn't match
+     * @throws java.util.ConcurrentModificationException if the expected current snapshot doesn't match
      */
     public void createSnapshotAtomically(long expectedCurrentSnapshot, long snapshotId,
             long schemaVersion, long nextCatalogId, long nextFileId) throws SQLException {
         // Verify current max snapshot matches expectation
         long actualCurrentSnapshot = getCurrentSnapshotId();
         if (actualCurrentSnapshot != expectedCurrentSnapshot) {
-            throw new java.util.concurrent.ConcurrentModificationException(
+            throw new java.util.ConcurrentModificationException(
                     "Snapshot conflict: expected " + expectedCurrentSnapshot +
                     " but found " + actualCurrentSnapshot);
         }

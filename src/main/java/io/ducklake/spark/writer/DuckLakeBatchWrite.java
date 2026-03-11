@@ -13,7 +13,7 @@ import org.apache.spark.sql.util.CaseInsensitiveStringMap;
 import java.io.File;
 import java.sql.SQLException;
 import java.util.*;
-import java.util.concurrent.ConcurrentModificationException;
+import java.util.ConcurrentModificationException;
 
 /**
  * Manages the lifecycle of a batch write operation to a DuckLake table.
@@ -137,7 +137,7 @@ public class DuckLakeBatchWrite implements Write, BatchWrite, RequiresDistributi
                 retryCount++;
                 if (retryCount > maxRetries) {
                     throw new RuntimeException("Failed to commit after " + maxRetries +
-                            " retries due to concurrent modifications. Table: " + tableInfo.tableName, e);
+                            " retries due to concurrent modifications. Table: " + tableInfo.name, e);
                 }
 
                 // Brief pause before retry (exponential backoff)

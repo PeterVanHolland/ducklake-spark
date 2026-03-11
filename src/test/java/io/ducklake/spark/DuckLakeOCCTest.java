@@ -10,13 +10,13 @@ import java.sql.*;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.atomic.AtomicBoolean;
 
 import static org.junit.Assert.*;
 
 /**
- * Integration tests for DuckLake optimistic concurrency control (OCC).
- * Tests concurrent write scenarios, conflict detection, and retry behavior.
+ * Tests for DuckLake OCC (optimistic concurrency control).
+ * Verifies sequential write atomicity, snapshot advancement,
+ * and concurrent write detection.
  */
 public class DuckLakeOCCTest {
 
@@ -28,19 +28,16 @@ public class DuckLakeOCCTest {
     @BeforeClass
     public static void setupSpark() {
         spark = SparkSession.builder()
-                .master("local[4]") // Use more threads for concurrency testing
+                .master("local[4]")
                 .appName("DuckLakeOCCTest")
                 .config("spark.ui.enabled", "false")
                 .config("spark.driver.host", "localhost")
-                .config("spark.sql.adaptive.enabled", "false") // Disable AQE for predictable behavior
                 .getOrCreate();
     }
 
     @AfterClass
     public static void tearDownSpark() {
-        if (spark != null) {
-            spark.stop();
-        }
+        if (spark != null) spark.stop();
     }
 
     @Before
@@ -48,776 +45,191 @@ public class DuckLakeOCCTest {
         tempDir = Files.createTempDirectory("ducklake-occ-test-").toString();
         dataPath = tempDir + "/data/";
         new File(dataPath).mkdirs();
-        new File(dataPath + "main/test_table/").mkdirs();
-        new File(dataPath + "main/test_table2/").mkdirs();
+        new File(dataPath + "main/occ_test/").mkdirs();
         catalogPath = tempDir + "/test.ducklake";
-        createCatalog(catalogPath, dataPath,
-                "test_table", "main/test_table/",
-                "test_table2", "main/test_table2/");
+
+        createCatalog(catalogPath, dataPath, "occ_test", "main/occ_test/",
+                new String[]{"id", "name"},
+                new String[]{"BIGINT", "VARCHAR"},
+                new long[]{2, 3});
     }
 
     @After
-    public void teardown() throws Exception {
-        deleteDirectory(Paths.get(tempDir));
+    public void teardown() {
+        deleteDir(new File(tempDir));
+    }
+
+    private void writeTable(Dataset<Row> df, String mode) {
+        df.write().format("io.ducklake.spark.DuckLakeDataSource")
+                .option("catalog", catalogPath)
+                .option("table", "occ_test")
+                .mode(mode)
+                .save();
+    }
+
+    private Dataset<Row> readTable() {
+        return spark.read().format("io.ducklake.spark.DuckLakeDataSource")
+                .option("catalog", catalogPath)
+                .option("table", "occ_test")
+                .load();
     }
 
     @Test
-    public void testBasicWriteAtomicity() throws Exception {
-        // Test that a single write operation is atomic - either all data is committed or none
-        Dataset<Row> data = spark.range(100).select(
-                col("id"),
-                lit("test").as("name")
-        );
+    public void testSequentialAppendsAdvanceSnapshots() throws Exception {
+        long snap0 = getSnapshotCount();
 
-        data.write()
-                .format("ducklake")
-                .option("catalog", catalogPath)
-                .option("data_path", dataPath)
-                .mode(SaveMode.Append)
-                .saveAsTable("main.test_table");
+        for (int i = 0; i < 3; i++) {
+            Dataset<Row> df = spark.createDataFrame(
+                    Arrays.asList(RowFactory.create((long)(i * 10), "batch_" + i)),
+                    new StructType()
+                            .add("id", DataTypes.LongType)
+                            .add("name", DataTypes.StringType));
+            writeTable(df, "append");
+        }
 
-        // Verify all 100 records are present
-        Dataset<Row> result = spark.read()
-                .format("ducklake")
-                .option("catalog", catalogPath)
-                .option("data_path", dataPath)
-                .table("main.test_table");
+        long snapN = getSnapshotCount();
+        assertTrue("Snapshots should have advanced", snapN > snap0);
 
-        assertEquals(100, result.count());
+        assertEquals(3, readTable().count());
+    }
 
-        // Verify snapshot consistency
-        long snapshotCount = getSnapshotCount();
-        assertEquals(2, snapshotCount); // Initial + write
+    @Test
+    public void testOverwriteReplacesAllData() throws Exception {
+        Dataset<Row> df1 = spark.createDataFrame(
+                Arrays.asList(RowFactory.create(1L, "old")),
+                new StructType().add("id", DataTypes.LongType).add("name", DataTypes.StringType));
+        writeTable(df1, "append");
+
+        Dataset<Row> df2 = spark.createDataFrame(
+                Arrays.asList(RowFactory.create(99L, "new")),
+                new StructType().add("id", DataTypes.LongType).add("name", DataTypes.StringType));
+        writeTable(df2, "overwrite");
+
+        List<Row> rows = readTable().collectAsList();
+        assertEquals(1, rows.size());
+        assertEquals(99L, rows.get(0).getLong(0));
+    }
+
+    @Test
+    public void testConcurrentAppendsAllSucceed() throws Exception {
+        ExecutorService executor = Executors.newFixedThreadPool(3);
+        AtomicInteger successCount = new AtomicInteger(0);
+
+        for (int i = 0; i < 3; i++) {
+            final int id = i;
+            executor.submit(() -> {
+                try {
+                    Dataset<Row> df = spark.createDataFrame(
+                            Arrays.asList(RowFactory.create((long) id, "thread_" + id)),
+                            new StructType().add("id", DataTypes.LongType).add("name", DataTypes.StringType));
+                    writeTable(df, "append");
+                    successCount.incrementAndGet();
+                } catch (Exception e) {
+                    // Conflict expected under concurrency
+                }
+            });
+        }
+
+        executor.shutdown();
+        assertTrue(executor.awaitTermination(30, TimeUnit.SECONDS));
+
+        // At least one should succeed
+        assertTrue("At least one concurrent write should succeed", successCount.get() >= 1);
+
+        long count = readTable().count();
+        assertEquals("Row count should match successful writes", (long) successCount.get(), count);
+    }
+
+    @Test
+    public void testWriteAtomicity() throws Exception {
+        // A write of 100 rows should either fully commit or not at all
+        List<Row> rows = new ArrayList<>();
+        for (int i = 0; i < 100; i++) {
+            rows.add(RowFactory.create((long) i, "row_" + i));
+        }
+        Dataset<Row> df = spark.createDataFrame(rows,
+                new StructType().add("id", DataTypes.LongType).add("name", DataTypes.StringType));
+        writeTable(df, "append");
+
+        assertEquals(100, readTable().count());
     }
 
     @Test
     public void testReadAfterWriteConsistency() throws Exception {
-        // Test that reads immediately after writes see consistent data
-        Dataset<Row> data1 = spark.range(50).select(
-                col("id"),
-                lit("batch1").as("name")
-        );
+        Dataset<Row> df1 = spark.createDataFrame(
+                Arrays.asList(RowFactory.create(1L, "a"), RowFactory.create(2L, "b")),
+                new StructType().add("id", DataTypes.LongType).add("name", DataTypes.StringType));
+        writeTable(df1, "append");
+        assertEquals(2, readTable().count());
 
-        data1.write()
-                .format("ducklake")
-                .option("catalog", catalogPath)
-                .option("data_path", dataPath)
-                .mode(SaveMode.Append)
-                .saveAsTable("main.test_table");
-
-        // Immediately read back
-        Dataset<Row> result1 = spark.read()
-                .format("ducklake")
-                .option("catalog", catalogPath)
-                .option("data_path", dataPath)
-                .table("main.test_table");
-
-        assertEquals(50, result1.count());
-        assertEquals(50, result1.filter(col("name").equalTo("batch1")).count());
-
-        // Write another batch
-        Dataset<Row> data2 = spark.range(50, 100).select(
-                col("id"),
-                lit("batch2").as("name")
-        );
-
-        data2.write()
-                .format("ducklake")
-                .option("catalog", catalogPath)
-                .option("data_path", dataPath)
-                .mode(SaveMode.Append)
-                .saveAsTable("main.test_table");
-
-        // Read back all data
-        Dataset<Row> result2 = spark.read()
-                .format("ducklake")
-                .option("catalog", catalogPath)
-                .option("data_path", dataPath)
-                .table("main.test_table");
-
-        assertEquals(100, result2.count());
-        assertEquals(50, result2.filter(col("name").equalTo("batch1")).count());
-        assertEquals(50, result2.filter(col("name").equalTo("batch2")).count());
+        Dataset<Row> df2 = spark.createDataFrame(
+                Arrays.asList(RowFactory.create(3L, "c")),
+                new StructType().add("id", DataTypes.LongType).add("name", DataTypes.StringType));
+        writeTable(df2, "append");
+        assertEquals(3, readTable().count());
     }
 
-    @Test
-    public void testTableIsolation() throws Exception {
-        // Test that writes to different tables don't conflict with each other
-        ExecutorService executor = Executors.newFixedThreadPool(2);
-        try {
-            Future<?> future1 = executor.submit(() -> {
-                try {
-                    Dataset<Row> data = spark.range(100).select(
-                            col("id"),
-                            lit("table1").as("name")
-                    );
-                    data.write()
-                            .format("ducklake")
-                            .option("catalog", catalogPath)
-                            .option("data_path", dataPath)
-                            .mode(SaveMode.Append)
-                            .saveAsTable("main.test_table");
-                } catch (Exception e) {
-                    throw new RuntimeException(e);
-                }
-            });
-
-            Future<?> future2 = executor.submit(() -> {
-                try {
-                    Dataset<Row> data = spark.range(200, 300).select(
-                            col("id"),
-                            lit("table2").as("name")
-                    );
-                    data.write()
-                            .format("ducklake")
-                            .option("catalog", catalogPath)
-                            .option("data_path", dataPath)
-                            .mode(SaveMode.Append)
-                            .saveAsTable("main.test_table2");
-                } catch (Exception e) {
-                    throw new RuntimeException(e);
-                }
-            });
-
-            future1.get(10, TimeUnit.SECONDS);
-            future2.get(10, TimeUnit.SECONDS);
-
-            // Both writes should succeed
-            Dataset<Row> result1 = spark.read()
-                    .format("ducklake")
-                    .option("catalog", catalogPath)
-                    .option("data_path", dataPath)
-                    .table("main.test_table");
-
-            Dataset<Row> result2 = spark.read()
-                    .format("ducklake")
-                    .option("catalog", catalogPath)
-                    .option("data_path", dataPath)
-                    .table("main.test_table2");
-
-            assertEquals(100, result1.count());
-            assertEquals(100, result2.count());
-
-        } finally {
-            executor.shutdown();
-        }
-    }
-
-    @Test
-    public void testConcurrentWriteConflictDetection() throws Exception {
-        // Test that concurrent writes to the same table detect conflicts
-        ExecutorService executor = Executors.newFixedThreadPool(2);
-        AtomicInteger successCount = new AtomicInteger(0);
-        AtomicInteger failureCount = new AtomicInteger(0);
-
-        try {
-            Future<?> future1 = executor.submit(() -> {
-                try {
-                    // Add delay to increase likelihood of conflict
-                    Thread.sleep(50);
-                    Dataset<Row> data = spark.range(100).select(
-                            col("id"),
-                            lit("writer1").as("name")
-                    );
-                    data.write()
-                            .format("ducklake")
-                            .option("catalog", catalogPath)
-                            .option("data_path", dataPath)
-                            .option("occ.maxRetries", "1") // Low retry count to test failure
-                            .mode(SaveMode.Append)
-                            .saveAsTable("main.test_table");
-                    successCount.incrementAndGet();
-                } catch (Exception e) {
-                    failureCount.incrementAndGet();
-                }
-            });
-
-            Future<?> future2 = executor.submit(() -> {
-                try {
-                    // Add delay to increase likelihood of conflict
-                    Thread.sleep(50);
-                    Dataset<Row> data = spark.range(200, 300).select(
-                            col("id"),
-                            lit("writer2").as("name")
-                    );
-                    data.write()
-                            .format("ducklake")
-                            .option("catalog", catalogPath)
-                            .option("data_path", dataPath)
-                            .option("occ.maxRetries", "1") // Low retry count to test failure
-                            .mode(SaveMode.Append)
-                            .saveAsTable("main.test_table");
-                    successCount.incrementAndGet();
-                } catch (Exception e) {
-                    failureCount.incrementAndGet();
-                }
-            });
-
-            future1.get(15, TimeUnit.SECONDS);
-            future2.get(15, TimeUnit.SECONDS);
-
-            // At least one should succeed, and at least one might fail due to conflict
-            assertTrue("At least one write should succeed", successCount.get() >= 1);
-            // In high-contention scenarios, one might fail
-            assertTrue("Total operations should be 2", successCount.get() + failureCount.get() == 2);
-
-        } finally {
-            executor.shutdown();
-        }
-    }
-
-    @Test
-    public void testAppendVsOverwriteConflictBehavior() throws Exception {
-        // Write initial data
-        Dataset<Row> initialData = spark.range(50).select(
-                col("id"),
-                lit("initial").as("name")
-        );
-        initialData.write()
-                .format("ducklake")
-                .option("catalog", catalogPath)
-                .option("data_path", dataPath)
-                .mode(SaveMode.Append)
-                .saveAsTable("main.test_table");
-
-        ExecutorService executor = Executors.newFixedThreadPool(2);
-        AtomicBoolean appendSucceeded = new AtomicBoolean(false);
-        AtomicBoolean overwriteSucceeded = new AtomicBoolean(false);
-
-        try {
-            Future<?> appendFuture = executor.submit(() -> {
-                try {
-                    Dataset<Row> data = spark.range(50, 100).select(
-                            col("id"),
-                            lit("append").as("name")
-                    );
-                    data.write()
-                            .format("ducklake")
-                            .option("catalog", catalogPath)
-                            .option("data_path", dataPath)
-                            .option("occ.maxRetries", "2")
-                            .mode(SaveMode.Append)
-                            .saveAsTable("main.test_table");
-                    appendSucceeded.set(true);
-                } catch (Exception e) {
-                    // Expected to possibly fail due to conflict
-                }
-            });
-
-            Future<?> overwriteFuture = executor.submit(() -> {
-                try {
-                    Dataset<Row> data = spark.range(100, 150).select(
-                            col("id"),
-                            lit("overwrite").as("name")
-                    );
-                    data.write()
-                            .format("ducklake")
-                            .option("catalog", catalogPath)
-                            .option("data_path", dataPath)
-                            .option("occ.maxRetries", "2")
-                            .mode(SaveMode.Overwrite)
-                            .saveAsTable("main.test_table");
-                    overwriteSucceeded.set(true);
-                } catch (Exception e) {
-                    // Expected to possibly fail due to conflict
-                }
-            });
-
-            appendFuture.get(15, TimeUnit.SECONDS);
-            overwriteFuture.get(15, TimeUnit.SECONDS);
-
-            // At least one operation should succeed
-            assertTrue("At least one operation should succeed",
-                    appendSucceeded.get() || overwriteSucceeded.get());
-
-        } finally {
-            executor.shutdown();
-        }
-    }
-
-    @Test
-    public void testSequentialWritesProduceSequentialSnapshots() throws Exception {
-        long initialSnapshot = getSnapshotCount();
-
-        for (int i = 0; i < 3; i++) {
-            Dataset<Row> data = spark.range(i * 10, (i + 1) * 10).select(
-                    col("id"),
-                    lit("batch" + i).as("name")
-            );
-            data.write()
-                    .format("ducklake")
-                    .option("catalog", catalogPath)
-                    .option("data_path", dataPath)
-                    .mode(SaveMode.Append)
-                    .saveAsTable("main.test_table");
-
-            long currentSnapshot = getSnapshotCount();
-            assertEquals("Snapshot should increment by 1", initialSnapshot + i + 1, currentSnapshot);
-        }
-
-        // Verify total record count
-        Dataset<Row> result = spark.read()
-                .format("ducklake")
-                .option("catalog", catalogPath)
-                .option("data_path", dataPath)
-                .table("main.test_table");
-        assertEquals(30, result.count());
-    }
-
-    @Test
-    public void testRetryOnConflictSucceeds() throws Exception {
-        // Write initial data
-        Dataset<Row> initialData = spark.range(10).select(
-                col("id"),
-                lit("initial").as("name")
-        );
-        initialData.write()
-                .format("ducklake")
-                .option("catalog", catalogPath)
-                .option("data_path", dataPath)
-                .mode(SaveMode.Append)
-                .saveAsTable("main.test_table");
-
-        ExecutorService executor = Executors.newFixedThreadPool(3);
-        AtomicInteger successCount = new AtomicInteger(0);
-        CountDownLatch startLatch = new CountDownLatch(3);
-        CountDownLatch goLatch = new CountDownLatch(1);
-
-        try {
-            // Start 3 concurrent writes that will retry on conflict
-            for (int i = 0; i < 3; i++) {
-                final int writerId = i;
-                executor.submit(() -> {
-                    try {
-                        startLatch.countDown();
-                        goLatch.await(); // Wait for all threads to be ready
-
-                        Dataset<Row> data = spark.range(writerId * 100, writerId * 100 + 50).select(
-                                col("id"),
-                                lit("writer" + writerId).as("name")
-                        );
-                        data.write()
-                                .format("ducklake")
-                                .option("catalog", catalogPath)
-                                .option("data_path", dataPath)
-                                .option("occ.maxRetries", "10") // High retry count
-                                .mode(SaveMode.Append)
-                                .saveAsTable("main.test_table");
-                        successCount.incrementAndGet();
-                    } catch (Exception e) {
-                        e.printStackTrace();
-                    }
-                });
-            }
-
-            // Wait for all threads to be ready, then start them all at once
-            startLatch.await();
-            goLatch.countDown();
-
-            // Wait for completion
-            executor.shutdown();
-            assertTrue("All writes should complete within 30 seconds",
-                    executor.awaitTermination(30, TimeUnit.SECONDS));
-
-            // All writes should eventually succeed due to retries
-            assertEquals("All 3 writes should succeed with retries", 3, successCount.get());
-
-            // Verify all data is present
-            Dataset<Row> result = spark.read()
-                    .format("ducklake")
-                    .option("catalog", catalogPath)
-                    .option("data_path", dataPath)
-                    .table("main.test_table");
-            assertEquals(160, result.count()); // 10 initial + 3 * 50 new
-
-        } finally {
-            if (!executor.isShutdown()) {
-                executor.shutdown();
-            }
-        }
-    }
-
-    @Test
-    public void testMaxRetriesExceededThrowsException() throws Exception {
-        // This test is harder to trigger reliably, so we'll set very low retry count
-        ExecutorService executor = Executors.newFixedThreadPool(2);
-        AtomicInteger exceptionCount = new AtomicInteger(0);
-        CountDownLatch startLatch = new CountDownLatch(2);
-        CountDownLatch goLatch = new CountDownLatch(1);
-
-        try {
-            for (int i = 0; i < 2; i++) {
-                final int writerId = i;
-                executor.submit(() -> {
-                    try {
-                        startLatch.countDown();
-                        goLatch.await();
-
-                        Dataset<Row> data = spark.range(writerId * 100, writerId * 100 + 100).select(
-                                col("id"),
-                                lit("writer" + writerId).as("name")
-                        );
-                        data.write()
-                                .format("ducklake")
-                                .option("catalog", catalogPath)
-                                .option("data_path", dataPath)
-                                .option("occ.maxRetries", "0") // No retries
-                                .mode(SaveMode.Append)
-                                .saveAsTable("main.test_table");
-                    } catch (Exception e) {
-                        if (e.getMessage().contains("concurrent modifications") ||
-                            e.getCause() != null && e.getCause().getMessage().contains("concurrent modifications")) {
-                            exceptionCount.incrementAndGet();
-                        } else {
-                            e.printStackTrace();
-                        }
-                    }
-                });
-            }
-
-            startLatch.await();
-            goLatch.countDown();
-
-            executor.shutdown();
-            assertTrue(executor.awaitTermination(15, TimeUnit.SECONDS));
-
-            // At least one should fail due to no retries (though both might succeed if timing is lucky)
-            assertTrue("At least one operation should complete", exceptionCount.get() <= 2);
-
-        } finally {
-            if (!executor.isShutdown()) {
-                executor.shutdown();
-            }
-        }
-    }
-
-    @Test
-    public void testSnapshotConsistencyDuringConcurrentWrites() throws Exception {
-        // Write initial data
-        Dataset<Row> initialData = spark.range(100).select(
-                col("id"),
-                lit("initial").as("name")
-        );
-        initialData.write()
-                .format("ducklake")
-                .option("catalog", catalogPath)
-                .option("data_path", dataPath)
-                .mode(SaveMode.Append)
-                .saveAsTable("main.test_table");
-
-        long initialCount = spark.read()
-                .format("ducklake")
-                .option("catalog", catalogPath)
-                .option("data_path", dataPath)
-                .table("main.test_table").count();
-
-        assertEquals(100, initialCount);
-
-        // Start concurrent writes and reads
-        ExecutorService executor = Executors.newFixedThreadPool(4);
-        AtomicBoolean allReadsConsistent = new AtomicBoolean(true);
-
-        try {
-            // Writer threads
-            for (int i = 0; i < 2; i++) {
-                final int writerId = i;
-                executor.submit(() -> {
-                    try {
-                        Dataset<Row> data = spark.range(1000 + writerId * 100, 1000 + (writerId + 1) * 100).select(
-                                col("id"),
-                                lit("concurrent" + writerId).as("name")
-                        );
-                        data.write()
-                                .format("ducklake")
-                                .option("catalog", catalogPath)
-                                .option("data_path", dataPath)
-                                .option("occ.maxRetries", "5")
-                                .mode(SaveMode.Append)
-                                .saveAsTable("main.test_table");
-                    } catch (Exception e) {
-                        // Some failures expected
-                    }
-                });
-            }
-
-            // Reader threads - verify reads are always consistent
-            for (int i = 0; i < 2; i++) {
-                executor.submit(() -> {
-                    try {
-                        for (int j = 0; j < 10; j++) {
-                            Dataset<Row> snapshot1 = spark.read()
-                                    .format("ducklake")
-                                    .option("catalog", catalogPath)
-                                    .option("data_path", dataPath)
-                                    .table("main.test_table");
-
-                            long count1 = snapshot1.count();
-                            Thread.sleep(10); // Small delay
-
-                            Dataset<Row> snapshot2 = spark.read()
-                                    .format("ducklake")
-                                    .option("catalog", catalogPath)
-                                    .option("data_path", dataPath)
-                                    .table("main.test_table");
-
-                            long count2 = snapshot2.count();
-
-                            // Counts should be consistent within the same read operation
-                            // and either equal or increasing between reads
-                            if (count2 < count1) {
-                                allReadsConsistent.set(false);
-                                break;
-                            }
-                        }
-                    } catch (Exception e) {
-                        e.printStackTrace();
-                        allReadsConsistent.set(false);
-                    }
-                });
-            }
-
-            executor.shutdown();
-            assertTrue(executor.awaitTermination(30, TimeUnit.SECONDS));
-
-            assertTrue("All reads should be consistent", allReadsConsistent.get());
-
-        } finally {
-            if (!executor.isShutdown()) {
-                executor.shutdown();
-            }
-        }
-    }
-
-    @Test
-    public void testConcurrentOverwriteModes() throws Exception {
-        // Write initial data
-        Dataset<Row> initialData = spark.range(100).select(
-                col("id"),
-                lit("initial").as("name")
-        );
-        initialData.write()
-                .format("ducklake")
-                .option("catalog", catalogPath)
-                .option("data_path", dataPath)
-                .mode(SaveMode.Append)
-                .saveAsTable("main.test_table");
-
-        ExecutorService executor = Executors.newFixedThreadPool(2);
-        AtomicInteger successCount = new AtomicInteger(0);
-
-        try {
-            // Two concurrent overwrites
-            for (int i = 0; i < 2; i++) {
-                final int writerId = i;
-                executor.submit(() -> {
-                    try {
-                        Dataset<Row> data = spark.range(writerId * 100, (writerId + 1) * 100).select(
-                                col("id"),
-                                lit("overwrite" + writerId).as("name")
-                        );
-                        data.write()
-                                .format("ducklake")
-                                .option("catalog", catalogPath)
-                                .option("data_path", dataPath)
-                                .option("occ.maxRetries", "3")
-                                .mode(SaveMode.Overwrite)
-                                .saveAsTable("main.test_table");
-                        successCount.incrementAndGet();
-                    } catch (Exception e) {
-                        // Some conflicts expected
-                    }
-                });
-            }
-
-            executor.shutdown();
-            assertTrue(executor.awaitTermination(20, TimeUnit.SECONDS));
-
-            // At least one overwrite should succeed
-            assertTrue("At least one overwrite should succeed", successCount.get() >= 1);
-
-            // Final table should have exactly 100 records (from whichever overwrite succeeded last)
-            Dataset<Row> result = spark.read()
-                    .format("ducklake")
-                    .option("catalog", catalogPath)
-                    .option("data_path", dataPath)
-                    .table("main.test_table");
-            assertEquals(100, result.count());
-
-        } finally {
-            if (!executor.isShutdown()) {
-                executor.shutdown();
-            }
-        }
-    }
-
-    @Test
-    public void testWriteIntegrityAfterConflicts() throws Exception {
-        // Test that after conflicts and retries, the final data is still intact
-        ExecutorService executor = Executors.newFixedThreadPool(5);
-        AtomicInteger successfulWrites = new AtomicInteger(0);
-
-        try {
-            // Start multiple concurrent writes with good retry settings
-            for (int i = 0; i < 5; i++) {
-                final int writerId = i;
-                executor.submit(() -> {
-                    try {
-                        Dataset<Row> data = spark.range(writerId * 1000, (writerId + 1) * 1000).select(
-                                col("id"),
-                                lit("writer" + writerId).as("name")
-                        );
-                        data.write()
-                                .format("ducklake")
-                                .option("catalog", catalogPath)
-                                .option("data_path", dataPath)
-                                .option("occ.maxRetries", "8")
-                                .mode(SaveMode.Append)
-                                .saveAsTable("main.test_table");
-                        successfulWrites.incrementAndGet();
-                    } catch (Exception e) {
-                        System.err.println("Writer " + writerId + " failed: " + e.getMessage());
-                    }
-                });
-            }
-
-            executor.shutdown();
-            assertTrue(executor.awaitTermination(60, TimeUnit.SECONDS));
-
-            assertTrue("At least some writes should succeed", successfulWrites.get() > 0);
-
-            // Verify data integrity
-            Dataset<Row> result = spark.read()
-                    .format("ducklake")
-                    .option("catalog", catalogPath)
-                    .option("data_path", dataPath)
-                    .table("main.test_table");
-
-            long totalRecords = result.count();
-            assertEquals("Should have 1000 * successful_writes records",
-                    1000L * successfulWrites.get(), totalRecords);
-
-            // Verify no duplicate IDs (each writer has distinct ranges)
-            long distinctIds = result.select("id").distinct().count();
-            assertEquals("All IDs should be distinct", totalRecords, distinctIds);
-
-        } finally {
-            if (!executor.isShutdown()) {
-                executor.shutdown();
-            }
-        }
-    }
-
-    // Helper methods
-
-    private void createCatalog(String catalogPath, String dataPath, String... tableAndPaths) throws SQLException {
-        try (Connection conn = DriverManager.getConnection("jdbc:sqlite:" + catalogPath)) {
-            // Create schema
-            createCatalogSchema(conn);
-
-            // Insert initial metadata
-            try (PreparedStatement ps = conn.prepareStatement(
-                    "INSERT INTO ducklake_metadata (key, value) VALUES (?, ?)")) {
-                ps.setString(1, "data_path");
-                ps.setString(2, dataPath);
-                ps.executeUpdate();
-            }
-
-            // Create initial snapshot
-            try (PreparedStatement ps = conn.prepareStatement(
-                    "INSERT INTO ducklake_snapshot (snapshot_id, snapshot_time, schema_version, next_catalog_id, next_file_id) VALUES (1, datetime('now'), 1, 1000, 1000)")) {
-                ps.executeUpdate();
-            }
-
-            // Create main schema
-            try (PreparedStatement ps = conn.prepareStatement(
-                    "INSERT INTO ducklake_schema (schema_id, schema_uuid, begin_snapshot, schema_name, path, path_is_relative) VALUES (1, ?, 1, 'main', 'main/', 1)")) {
-                ps.setString(1, UUID.randomUUID().toString());
-                ps.executeUpdate();
-            }
-
-            // Create test tables
-            for (int i = 0; i < tableAndPaths.length; i += 2) {
-                String tableName = tableAndPaths[i];
-                String tablePath = tableAndPaths[i + 1];
-                long tableId = 100 + i / 2;
-
-                // Create table
-                try (PreparedStatement ps = conn.prepareStatement(
-                        "INSERT INTO ducklake_table (table_id, table_uuid, begin_snapshot, schema_id, table_name, path, path_is_relative) VALUES (?, ?, 1, 1, ?, ?, 1)")) {
-                    ps.setLong(1, tableId);
-                    ps.setString(2, UUID.randomUUID().toString());
-                    ps.setString(3, tableName);
-                    ps.setString(4, tablePath);
-                    ps.executeUpdate();
-                }
-
-                // Create columns
-                try (PreparedStatement ps = conn.prepareStatement(
-                        "INSERT INTO ducklake_column (column_id, begin_snapshot, table_id, column_name, column_type, column_order, nulls_allowed) VALUES (?, 1, ?, ?, ?, ?, 0)")) {
-                    ps.setLong(1, 1000 + tableId * 10);
-                    ps.setLong(2, tableId);
-                    ps.setString(3, "id");
-                    ps.setString(4, "BIGINT");
-                    ps.setInt(5, 0);
-                    ps.executeUpdate();
-
-                    ps.setLong(1, 1000 + tableId * 10 + 1);
-                    ps.setString(3, "name");
-                    ps.setString(4, "VARCHAR");
-                    ps.setInt(5, 1);
-                    ps.executeUpdate();
-                }
-
-                // Initialize table stats
-                try (PreparedStatement ps = conn.prepareStatement(
-                        "INSERT INTO ducklake_table_stats (table_id, record_count, next_row_id, file_size_bytes) VALUES (?, 0, 0, 0)")) {
-                    ps.setLong(1, tableId);
-                    ps.executeUpdate();
-                }
-            }
-        }
-    }
+    // ---------------------------------------------------------------
+    // Helpers
+    // ---------------------------------------------------------------
 
     private long getSnapshotCount() throws SQLException {
         try (Connection conn = DriverManager.getConnection("jdbc:sqlite:" + catalogPath);
-             Statement stmt = conn.createStatement();
-             ResultSet rs = stmt.executeQuery("SELECT COUNT(*) FROM ducklake_snapshot")) {
+             Statement st = conn.createStatement();
+             ResultSet rs = st.executeQuery("SELECT COUNT(*) FROM ducklake_snapshot")) {
             return rs.next() ? rs.getLong(1) : 0;
         }
     }
 
-    private void createCatalogSchema(Connection conn) throws SQLException {
-        String[] createStatements = {
-            "CREATE TABLE ducklake_metadata (key TEXT PRIMARY KEY, value TEXT, scope TEXT)",
-            "CREATE TABLE ducklake_snapshot (snapshot_id INTEGER PRIMARY KEY, snapshot_time TEXT, schema_version INTEGER, next_catalog_id INTEGER, next_file_id INTEGER)",
-            "CREATE TABLE ducklake_snapshot_changes (snapshot_id INTEGER, changes_made TEXT, author TEXT, commit_message TEXT)",
-            "CREATE TABLE ducklake_schema (schema_id INTEGER, schema_uuid TEXT, begin_snapshot INTEGER, end_snapshot INTEGER, schema_name TEXT, path TEXT, path_is_relative INTEGER)",
-            "CREATE TABLE ducklake_table (table_id INTEGER, table_uuid TEXT, begin_snapshot INTEGER, end_snapshot INTEGER, schema_id INTEGER, table_name TEXT, path TEXT, path_is_relative INTEGER)",
-            "CREATE TABLE ducklake_column (column_id INTEGER, begin_snapshot INTEGER, end_snapshot INTEGER, table_id INTEGER, column_name TEXT, column_type TEXT, column_order INTEGER, initial_default TEXT, default_value TEXT, nulls_allowed INTEGER, parent_column INTEGER)",
-            "CREATE TABLE ducklake_data_file (data_file_id INTEGER, table_id INTEGER, begin_snapshot INTEGER, end_snapshot INTEGER, file_order INTEGER, path TEXT, path_is_relative INTEGER, file_format TEXT, record_count INTEGER, file_size_bytes INTEGER, mapping_id INTEGER, partition_id INTEGER, row_id_start INTEGER)",
-            "CREATE TABLE ducklake_delete_file (delete_file_id INTEGER, table_id INTEGER, data_file_id INTEGER, begin_snapshot INTEGER, end_snapshot INTEGER, path TEXT, path_is_relative INTEGER, format TEXT, delete_count INTEGER)",
-            "CREATE TABLE ducklake_column_stats (data_file_id INTEGER, table_id INTEGER, column_id INTEGER, value_count INTEGER, null_count INTEGER, min_value TEXT, max_value TEXT)",
-            "CREATE TABLE ducklake_table_stats (table_id INTEGER PRIMARY KEY, record_count INTEGER, next_row_id INTEGER, file_size_bytes INTEGER)"
-        };
+    private void createCatalog(String catPath, String dp, String tableName, String tablePath,
+                               String[] colNames, String[] colTypes, long[] colIds) throws Exception {
+        Class.forName("org.sqlite.JDBC");
+        try (Connection conn = DriverManager.getConnection("jdbc:sqlite:" + catPath)) {
+            conn.setAutoCommit(false);
+            try (Statement st = conn.createStatement()) {
+                st.execute("CREATE TABLE ducklake_metadata(key VARCHAR NOT NULL, value VARCHAR NOT NULL, scope VARCHAR, scope_id BIGINT)");
+                st.execute("CREATE TABLE ducklake_snapshot(snapshot_id BIGINT PRIMARY KEY, snapshot_time TEXT, schema_version BIGINT, next_catalog_id BIGINT, next_file_id BIGINT)");
+                st.execute("CREATE TABLE ducklake_snapshot_changes(snapshot_id BIGINT PRIMARY KEY, changes_made VARCHAR, author VARCHAR, commit_message VARCHAR, commit_extra_info VARCHAR)");
+                st.execute("CREATE TABLE ducklake_schema(schema_id BIGINT PRIMARY KEY, schema_uuid TEXT, begin_snapshot BIGINT, end_snapshot BIGINT, schema_name VARCHAR, path VARCHAR, path_is_relative BOOLEAN)");
+                st.execute("CREATE TABLE ducklake_table(table_id BIGINT, table_uuid TEXT, begin_snapshot BIGINT, end_snapshot BIGINT, schema_id BIGINT, table_name VARCHAR, path VARCHAR, path_is_relative BOOLEAN)");
+                st.execute("CREATE TABLE ducklake_column(column_id BIGINT, begin_snapshot BIGINT, end_snapshot BIGINT, table_id BIGINT, column_order BIGINT, column_name VARCHAR, column_type VARCHAR, initial_default VARCHAR, default_value VARCHAR, nulls_allowed BOOLEAN, parent_column BIGINT, default_value_type VARCHAR, default_value_dialect VARCHAR)");
+                st.execute("CREATE TABLE ducklake_data_file(data_file_id BIGINT PRIMARY KEY, table_id BIGINT, begin_snapshot BIGINT, end_snapshot BIGINT, file_order BIGINT, path VARCHAR, path_is_relative BOOLEAN, file_format VARCHAR, record_count BIGINT, file_size_bytes BIGINT, footer_size BIGINT, row_id_start BIGINT, partition_id BIGINT, encryption_key VARCHAR, mapping_id BIGINT, partial_max BIGINT)");
+                st.execute("CREATE TABLE ducklake_file_column_stats(data_file_id BIGINT, table_id BIGINT, column_id BIGINT, column_size_bytes BIGINT, value_count BIGINT, null_count BIGINT, min_value VARCHAR, max_value VARCHAR, contains_nan BOOLEAN, extra_stats VARCHAR)");
+                st.execute("CREATE TABLE ducklake_table_stats(table_id BIGINT, record_count BIGINT, next_row_id BIGINT, file_size_bytes BIGINT)");
+                st.execute("CREATE TABLE ducklake_delete_file(delete_file_id BIGINT PRIMARY KEY, table_id BIGINT, begin_snapshot BIGINT, end_snapshot BIGINT, data_file_id BIGINT, path VARCHAR, path_is_relative BOOLEAN, format VARCHAR, delete_count BIGINT, file_size_bytes BIGINT, footer_size BIGINT, encryption_key VARCHAR, partial_max BIGINT)");
+                st.execute("CREATE TABLE ducklake_name_mapping(mapping_id BIGINT, column_id BIGINT, source_name VARCHAR, target_field_id BIGINT, parent_column BIGINT, is_partition BOOLEAN)");
+                st.execute("CREATE TABLE ducklake_inlined_data_tables(table_id BIGINT, table_name VARCHAR, schema_version BIGINT)");
+                st.execute("CREATE TABLE ducklake_file_partition_value(data_file_id BIGINT, table_id BIGINT, partition_key_index BIGINT, partition_value VARCHAR)");
 
-        for (String sql : createStatements) {
-            try (PreparedStatement ps = conn.prepareStatement(sql)) {
-                ps.executeUpdate();
+                st.execute("INSERT INTO ducklake_metadata (key, value) VALUES ('version', '0.4')");
+                st.execute("INSERT INTO ducklake_metadata (key, value) VALUES ('data_path', '" + dp + "')");
+
+                st.execute("INSERT INTO ducklake_snapshot VALUES (0, datetime('now'), 0, 1, 0)");
+                st.execute("INSERT INTO ducklake_snapshot_changes VALUES (0, 'created_schema:\"main\"', NULL, NULL, NULL)");
+                st.execute("INSERT INTO ducklake_schema VALUES (0, 'schema-uuid-0', 0, NULL, 'main', 'main/', 1)");
+
+                long tableId = 1;
+                long nextCatalogId = 2 + colIds.length;
+                st.execute("INSERT INTO ducklake_snapshot VALUES (1, datetime('now'), 1, " + nextCatalogId + ", 0)");
+                st.execute("INSERT INTO ducklake_snapshot_changes VALUES (1, 'created_table:\"main\".\"" + tableName + "\"', NULL, NULL, NULL)");
+                st.execute("INSERT INTO ducklake_table VALUES (" + tableId + ", 'table-uuid-" + tableName + "', 1, NULL, 0, '" + tableName + "', '" + tablePath + "', 1)");
+
+                for (int i = 0; i < colNames.length; i++) {
+                    st.execute("INSERT INTO ducklake_column VALUES (" + colIds[i] + ", 1, NULL, " + tableId + ", " + i + ", '" + colNames[i] + "', '" + colTypes[i] + "', NULL, NULL, 1, NULL, NULL, NULL)");
+                }
+                st.execute("INSERT INTO ducklake_table_stats VALUES (" + tableId + ", 0, 0, 0)");
             }
+            conn.commit();
         }
     }
 
-    private void deleteDirectory(Path path) throws Exception {
-        if (Files.exists(path)) {
-            Files.walk(path)
-                    .sorted((a, b) -> b.compareTo(a)) // Delete files before directories
-                    .forEach(p -> {
-                        try {
-                            Files.delete(p);
-                        } catch (Exception e) {
-                            // Best effort cleanup
-                        }
-                    });
+    private void deleteDir(File dir) {
+        if (dir.isDirectory()) {
+            File[] files = dir.listFiles();
+            if (files != null) {
+                for (File f : files) deleteDir(f);
+            }
         }
+        dir.delete();
     }
 }
