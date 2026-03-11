@@ -1402,8 +1402,9 @@ public class DuckLakeMetadataBackend implements AutoCloseable {
             int colOrder;
             boolean nullable;
             String initialDefault;
+            String defaultValue;
             try (PreparedStatement ps = getConnection().prepareStatement(
-                    "SELECT column_id, column_type, column_order, nulls_allowed, initial_default " +
+                    "SELECT column_id, column_type, column_order, nulls_allowed, initial_default, default_value " +
                     "FROM ducklake_column WHERE table_id = ? AND column_name = ? AND end_snapshot IS NULL")) {
                 ps.setLong(1, tableId);
                 ps.setString(2, oldName);
@@ -1416,6 +1417,7 @@ public class DuckLakeMetadataBackend implements AutoCloseable {
                     colOrder = rs.getInt("column_order");
                     nullable = rs.getInt("nulls_allowed") == 1;
                     initialDefault = rs.getString("initial_default");
+                    defaultValue = rs.getString("default_value");
                 }
             }
 
@@ -1438,7 +1440,7 @@ public class DuckLakeMetadataBackend implements AutoCloseable {
                     "INSERT INTO ducklake_column (column_id, begin_snapshot, end_snapshot, table_id, " +
                     "column_order, column_name, column_type, initial_default, default_value, " +
                     "nulls_allowed, parent_column, default_value_type, default_value_dialect) " +
-                    "VALUES (?, ?, NULL, ?, ?, ?, ?, ?, NULL, ?, NULL, NULL, NULL)")) {
+                    "VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL)")) {
                 ps.setLong(1, columnId);
                 ps.setLong(2, newSnap);
                 ps.setLong(3, tableId);
@@ -1450,7 +1452,12 @@ public class DuckLakeMetadataBackend implements AutoCloseable {
                 } else {
                     ps.setNull(7, java.sql.Types.VARCHAR);
                 }
-                ps.setInt(8, nullable ? 1 : 0);
+                if (defaultValue != null) {
+                    ps.setString(8, defaultValue);
+                } else {
+                    ps.setNull(8, java.sql.Types.VARCHAR);
+                }
+                ps.setInt(9, nullable ? 1 : 0);
                 ps.executeUpdate();
             }
 

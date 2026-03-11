@@ -189,12 +189,16 @@ public class DuckLakeDefaultsConstraintsTest {
             long snapshot2 = backend.getCurrentSnapshotId();
             backend.addColumnWithDefault(table.tableId, "col2", "VARCHAR", true, "'old'", "'new'");
 
+            long snapshot3 = backend.getCurrentSnapshotId();
+
             // Verify columns at different snapshots
             List<ColumnInfo> cols1 = backend.getColumns(table.tableId, snapshot1);
             List<ColumnInfo> cols2 = backend.getColumns(table.tableId, snapshot2);
+            List<ColumnInfo> cols3 = backend.getColumns(table.tableId, snapshot3);
 
             assertEquals(1, cols1.size()); // Only id column at snapshot1
-            assertEquals(3, cols2.size()); // id, col1, col2 at snapshot2
+            assertEquals(2, cols2.size()); // id, col1 at snapshot2
+            assertEquals(3, cols3.size()); // id, col1, col2 at snapshot3
         }
     }
 
