@@ -96,6 +96,11 @@ public class DuckLakeBatchWrite implements Write, BatchWrite, RequiresDistributi
 
     @Override
     public DataWriterFactory createBatchWriterFactory(PhysicalWriteInfo info) {
+        // TODO: Add constraint validation here
+        // Load constraints from metadata backend and validate against schema
+        // For NOT NULL constraints: check if nullable columns have NOT NULL constraint
+        // For UNIQUE constraints: this would require coordination across partitions
+
         String writeBasePath = dataPath + tablePath;
         return new DuckLakeDataWriterFactory(schema, columnIds, writeBasePath, tablePath, partitionInfos);
     }
