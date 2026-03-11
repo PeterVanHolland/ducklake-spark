@@ -4,6 +4,7 @@ import org.apache.spark.sql.connector.write.WriterCommitMessage;
 
 import java.io.Serializable;
 import java.util.List;
+import java.util.Map;
 
 /**
  * Commit message from a single partition writer.
@@ -17,15 +18,26 @@ public class DuckLakeWriterCommitMessage implements WriterCommitMessage {
     public final long recordCount;
     public final long fileSize;
     public final List<ColumnStats> columnStats;
+    public final Map<Integer, String> partitionValues;  // partition_key_index -> partition_value
+    public String[] partitionColNames;   // set by partitioned writer
+    public String[] partitionColValues;  // set by partitioned writer
 
     public DuckLakeWriterCommitMessage(String absolutePath, String relativePath,
                                         long recordCount, long fileSize,
                                         List<ColumnStats> columnStats) {
+        this(absolutePath, relativePath, recordCount, fileSize, columnStats, null);
+    }
+
+    public DuckLakeWriterCommitMessage(String absolutePath, String relativePath,
+                                        long recordCount, long fileSize,
+                                        List<ColumnStats> columnStats,
+                                        Map<Integer, String> partitionValues) {
         this.absolutePath = absolutePath;
         this.relativePath = relativePath;
         this.recordCount = recordCount;
         this.fileSize = fileSize;
         this.columnStats = columnStats;
+        this.partitionValues = partitionValues;
     }
 
     public static class ColumnStats implements Serializable {

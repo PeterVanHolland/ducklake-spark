@@ -445,6 +445,168 @@ public class DuckLakeMetadataBackend implements AutoCloseable {
         return result;
     }
 
+    /** Get partition column information for a table. */
+    public List<PartitionInfo> getPartitionColumns(long tableId, long snapshotId) throws SQLException {
+        List<PartitionInfo> result = new ArrayList<>();
+
+        // Query the catalog for partition columns
+        // First try to use ducklake_table_partition_column if it exists
+        try (PreparedStatement ps = getConnection().prepareStatement(
+                "SELECT c.column_id, c.column_name, " +
+                "CASE WHEN nm.is_partition = 1 THEN tpc.partition_expression ELSE NULL END as partition_expression, " +
+                "CASE WHEN nm.is_partition = 1 THEN ROW_NUMBER() OVER (ORDER BY c.column_order) - 1 ELSE -1 END as partition_index " +
+                "FROM ducklake_column c " +
+                "LEFT JOIN ducklake_name_mapping nm ON nm.column_id = c.column_id " +
+                "LEFT JOIN ducklake_table_partition_column tpc ON tpc.column_id = c.column_id AND tpc.table_id = ? " +
+                "WHERE c.table_id = ? AND c.end_snapshot IS NULL " +
+                "AND (c.begin_snapshot <= ? AND (c.end_snapshot IS NULL OR c.end_snapshot > ?)) " +
+                "AND nm.is_partition = 1 " +
+                "ORDER BY c.column_order")) {
+
+            ps.setLong(1, tableId);
+            ps.setLong(2, tableId);
+            ps.setLong(3, snapshotId);
+            ps.setLong(4, snapshotId);
+
+            try (ResultSet rs = ps.executeQuery()) {
+                int partitionIndex = 0;
+                while (rs.next()) {
+                    result.add(new PartitionInfo(
+                            rs.getLong("column_id"),
+                            rs.getString("column_name"),
+                            rs.getString("partition_expression"),
+                            partitionIndex++
+                    ));
+                }
+            }
+        } catch (SQLException e) {
+            // If ducklake_table_partition_column doesn't exist, fall back to simple is_partition check
+            try (PreparedStatement ps = getConnection().prepareStatement(
+                    "SELECT c.column_id, c.column_name " +
+                    "FROM ducklake_column c " +
+                    "JOIN ducklake_name_mapping nm ON nm.column_id = c.column_id " +
+                    "WHERE c.table_id = ? " +
+                    "AND (c.begin_snapshot <= ? AND (c.end_snapshot IS NULL OR c.end_snapshot > ?)) " +
+                    "AND nm.is_partition = 1 " +
+                    "ORDER BY c.column_order")) {
+
+                ps.setLong(1, tableId);
+                ps.setLong(2, snapshotId);
+                ps.setLong(3, snapshotId);
+
+                try (ResultSet rs = ps.executeQuery()) {
+                    int partitionIndex = 0;
+                    while (rs.next()) {
+                        result.add(new PartitionInfo(
+                                rs.getLong("column_id"),
+                                rs.getString("column_name"),
+                                null,  // identity partition
+                                partitionIndex++
+                        ));
+                    }
+                }
+            }
+        }
+
+        return result;
+    }
+
+    /** Get data files that match partition filters. */
+    public List<DataFileInfo> getDataFilesForPartition(long tableId, long snapshotId,
+                                                       List<PartitionFilter> partitionFilters) throws SQLException {
+        if (partitionFilters == null || partitionFilters.isEmpty()) {
+            return getDataFiles(tableId, snapshotId);
+        }
+
+        List<DataFileInfo> result = new ArrayList<>();
+
+        // Build WHERE clause for partition filtering
+        StringBuilder whereClause = new StringBuilder();
+        List<Object> params = new ArrayList<>();
+
+        // Add base filters
+        whereClause.append("df.table_id = ? AND df.begin_snapshot <= ? AND (df.end_snapshot IS NULL OR df.end_snapshot > ?)");
+        params.add(tableId);
+        params.add(snapshotId);
+        params.add(snapshotId);
+
+        // Add partition filters
+        for (PartitionFilter filter : partitionFilters) {
+            whereClause.append(" AND EXISTS (")
+                      .append("SELECT 1 FROM ducklake_file_partition_value fpv ")
+                      .append("WHERE fpv.data_file_id = df.data_file_id ")
+                      .append("AND fpv.table_id = df.table_id ")
+                      .append("AND fpv.partition_key_index = ? ");
+            params.add(filter.partitionIndex);
+
+            switch (filter.operator) {
+                case "=":
+                    whereClause.append("AND fpv.partition_value = ?");
+                    params.add(filter.value.toString());
+                    break;
+                case "IN":
+                    @SuppressWarnings("unchecked")
+                    List<Object> values = (List<Object>) filter.value;
+                    whereClause.append("AND fpv.partition_value IN (");
+                    for (int i = 0; i < values.size(); i++) {
+                        if (i > 0) whereClause.append(",");
+                        whereClause.append("?");
+                        params.add(values.get(i).toString());
+                    }
+                    whereClause.append(")");
+                    break;
+                case "<":
+                    whereClause.append("AND fpv.partition_value < ?");
+                    params.add(filter.value.toString());
+                    break;
+                case ">":
+                    whereClause.append("AND fpv.partition_value > ?");
+                    params.add(filter.value.toString());
+                    break;
+                case "<=":
+                    whereClause.append("AND fpv.partition_value <= ?");
+                    params.add(filter.value.toString());
+                    break;
+                case ">=":
+                    whereClause.append("AND fpv.partition_value >= ?");
+                    params.add(filter.value.toString());
+                    break;
+                default:
+                    throw new IllegalArgumentException("Unsupported partition filter operator: " + filter.operator);
+            }
+
+            whereClause.append(")");
+        }
+
+        String sql = "SELECT df.data_file_id, df.path, df.path_is_relative, df.file_format, " +
+                     "df.record_count, df.file_size_bytes, df.mapping_id, df.partition_id " +
+                     "FROM ducklake_data_file df " +
+                     "WHERE " + whereClause.toString() +
+                     " ORDER BY df.file_order";
+
+        try (PreparedStatement ps = getConnection().prepareStatement(sql)) {
+            for (int i = 0; i < params.size(); i++) {
+                ps.setObject(i + 1, params.get(i));
+            }
+
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    result.add(new DataFileInfo(
+                            rs.getLong("data_file_id"),
+                            rs.getString("path"),
+                            rs.getBoolean("path_is_relative"),
+                            rs.getString("file_format"),
+                            rs.getLong("record_count"),
+                            rs.getLong("file_size_bytes"),
+                            rs.getObject("mapping_id") == null ? -1 : rs.getLong("mapping_id"),
+                            rs.getObject("partition_id") == null ? -1 : rs.getLong("partition_id")));
+                }
+            }
+        }
+
+        return result;
+    }
+
     /** Get name mappings for a mapping ID (for column renames). */
     public Map<Long, String> getNameMapping(long mappingId) throws SQLException {
         Map<Long, String> result = new HashMap<>();
@@ -611,6 +773,27 @@ public class DuckLakeMetadataBackend implements AutoCloseable {
             ps.setLong(7, fileSizeBytes);
             ps.setLong(8, rowIdStart);
             ps.executeUpdate();
+        }
+    }
+
+    /** Insert partition values for a data file. */
+    public void insertPartitionValues(long dataFileId, long tableId,
+                                     Map<Integer, String> partitionValues) throws SQLException {
+        if (partitionValues == null || partitionValues.isEmpty()) {
+            return;
+        }
+
+        try (PreparedStatement ps = getConnection().prepareStatement(
+                "INSERT INTO ducklake_file_partition_value (data_file_id, table_id, partition_key_index, partition_value) " +
+                "VALUES (?, ?, ?, ?)")) {
+            for (Map.Entry<Integer, String> entry : partitionValues.entrySet()) {
+                ps.setLong(1, dataFileId);
+                ps.setLong(2, tableId);
+                ps.setInt(3, entry.getKey());
+                ps.setString(4, entry.getValue());
+                ps.addBatch();
+            }
+            ps.executeBatch();
         }
     }
 
@@ -1250,7 +1433,6 @@ public class DuckLakeMetadataBackend implements AutoCloseable {
         }
     }
 
-    // ---------------------------------------------------------------
     // Data classes
     // ---------------------------------------------------------------
 
@@ -1418,6 +1600,37 @@ public class DuckLakeMetadataBackend implements AutoCloseable {
             this.endSnapshot = endSnapshot;
             this.path = path;
             this.pathIsRelative = pathIsRelative;
+        }
+    }
+
+    public static class PartitionInfo implements java.io.Serializable {
+        private static final long serialVersionUID = 1L;
+        public final long columnId;
+        public final String columnName;
+        public final String partitionExpression;  // null for identity partitions
+        public final int partitionIndex;
+
+        public PartitionInfo(long columnId, String columnName, String partitionExpression, int partitionIndex) {
+            this.columnId = columnId;
+            this.columnName = columnName;
+            this.partitionExpression = partitionExpression;
+            this.partitionIndex = partitionIndex;
+        }
+
+        public boolean isIdentityPartition() {
+            return partitionExpression == null;
+        }
+    }
+
+    public static class PartitionFilter {
+        public final int partitionIndex;
+        public final String operator;  // "=", "IN", "<", ">", "<=", ">="
+        public final Object value;     // Single value or List for IN operator
+
+        public PartitionFilter(int partitionIndex, String operator, Object value) {
+            this.partitionIndex = partitionIndex;
+            this.operator = operator;
+            this.value = value;
         }
     }
 }

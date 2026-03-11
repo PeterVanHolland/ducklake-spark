@@ -62,8 +62,25 @@ public class DuckLakeScan implements Scan, Batch {
             }
 
             String dataPath = backend.getDataPath();
-            List<DataFileInfo> files = backend.getDataFiles(table.tableId, snapshotId);
             List<ColumnInfo> columns = backend.getColumns(table.tableId, snapshotId);
+
+            // Get partition information for partition pruning
+            List<DuckLakeMetadataBackend.PartitionInfo> partitionInfos = backend.getPartitionColumns(table.tableId, snapshotId);
+
+            // Extract partition filters from pushed filters
+            List<DuckLakeMetadataBackend.PartitionFilter> partitionFilters = new ArrayList<>();
+            if (!partitionInfos.isEmpty() && filters != null && filters.length > 0) {
+                DuckLakePartitionFilterExtractor extractor = new DuckLakePartitionFilterExtractor(partitionInfos);
+                partitionFilters = extractor.extractPartitionFilters(filters);
+            }
+
+            // Get data files, using partition pruning if applicable
+            List<DataFileInfo> files;
+            if (!partitionFilters.isEmpty()) {
+                files = backend.getDataFilesForPartition(table.tableId, snapshotId, partitionFilters);
+            } else {
+                files = backend.getDataFiles(table.tableId, snapshotId);
+            }
 
             // Build column ID -> name mapping for stats-based pruning
             Map<Long, String> colIdToName = new HashMap<>();
