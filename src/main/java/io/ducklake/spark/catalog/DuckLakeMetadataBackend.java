@@ -1993,4 +1993,82 @@ public class DuckLakeMetadataBackend implements AutoCloseable {
             this.value = value;
         }
     }
+
+    /** Get ALL active delete files for a table at a specific snapshot (bulk query, no N+1). */
+    public Map<Long, List<DeleteFileInfo>> getAllDeleteFilesForTable(long tableId, long snapshotId) throws SQLException {
+        Map<Long, List<DeleteFileInfo>> result = new HashMap<>();
+        try (PreparedStatement ps = getConnection().prepareStatement(
+                "SELECT delete_file_id, data_file_id, path, path_is_relative, format, delete_count " +
+                "FROM ducklake_delete_file " +
+                "WHERE table_id = ? AND begin_snapshot <= ? " +
+                "AND (end_snapshot IS NULL OR end_snapshot > ?)")) {
+            ps.setLong(1, tableId);
+            ps.setLong(2, snapshotId);
+            ps.setLong(3, snapshotId);
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    long dataFileId = rs.getLong("data_file_id");
+                    result.computeIfAbsent(dataFileId, k -> new ArrayList<>()).add(
+                        new DeleteFileInfo(
+                            rs.getLong("delete_file_id"),
+                            dataFileId,
+                            rs.getString("path"),
+                            rs.getInt("path_is_relative") == 1,
+                            rs.getString("format"),
+                            rs.getLong("delete_count"),
+                            -1L));
+                }
+            }
+        }
+        return result;
+    }
+
+    /** Get ALL column stats for all active files of a table (bulk query, no N+1). */
+    public Map<Long, List<FileColumnStats>> getAllFileColumnStatsForTable(long tableId, long snapshotId) throws SQLException {
+        Map<Long, List<FileColumnStats>> result = new HashMap<>();
+        try (PreparedStatement ps = getConnection().prepareStatement(
+                "SELECT data_file_id, column_id, min_value, max_value, null_count, value_count " +
+                "FROM ducklake_file_column_stats " +
+                "WHERE table_id = ?")) {
+            ps.setLong(1, tableId);
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    long fileId = rs.getLong("data_file_id");
+                    result.computeIfAbsent(fileId, k -> new ArrayList<>()).add(
+                        new FileColumnStats(
+                            rs.getLong("column_id"),
+                            rs.getString("min_value"),
+                            rs.getString("max_value"),
+                            rs.getLong("null_count"),
+                            rs.getLong("value_count")));
+                }
+            }
+        }
+        return result;
+    }
+
+    /** Get ALL name mappings referenced by active files (bulk query, no N+1). */
+    public Map<Long, Map<Long, String>> getAllNameMappingsForTable(long tableId, long snapshotId) throws SQLException {
+        Map<Long, Map<Long, String>> result = new HashMap<>();
+        try (PreparedStatement ps = getConnection().prepareStatement(
+                "SELECT DISTINCT df.mapping_id, nm.target_field_id, nm.source_name " +
+                "FROM ducklake_data_file df " +
+                "JOIN ducklake_name_mapping nm ON df.mapping_id = nm.mapping_id " +
+                "WHERE df.table_id = ? AND df.begin_snapshot <= ? " +
+                "AND (df.end_snapshot IS NULL OR df.end_snapshot > ?) " +
+                "AND df.mapping_id IS NOT NULL")) {
+            ps.setLong(1, tableId);
+            ps.setLong(2, snapshotId);
+            ps.setLong(3, snapshotId);
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    long mappingId = rs.getLong("mapping_id");
+                    result.computeIfAbsent(mappingId, k -> new HashMap<>())
+                        .put(rs.getLong("target_field_id"), rs.getString("source_name"));
+                }
+            }
+        }
+        return result;
+    }
+
 }

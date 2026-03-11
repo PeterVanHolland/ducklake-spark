@@ -7,7 +7,8 @@ import org.apache.spark.sql.types.StructType;
 import java.io.Serializable;
 
 /**
- * Creates partition readers for DuckLake data files (Parquet) and inlined data.
+ * Creates partition readers for DuckLake data files (Parquet), binned multi-file
+ * partitions, and inlined data.
  */
 public class DuckLakePartitionReaderFactory implements PartitionReaderFactory, Serializable {
     private static final long serialVersionUID = 1L;
@@ -25,6 +26,10 @@ public class DuckLakePartitionReaderFactory implements PartitionReaderFactory, S
         if (partition instanceof DuckLakeInlinedInputPartition) {
             return new DuckLakeInlinedPartitionReader(
                     (DuckLakeInlinedInputPartition) partition, requiredSchema);
+        }
+        if (partition instanceof DuckLakeBinnedInputPartition) {
+            return new DuckLakeBinnedPartitionReader(
+                    (DuckLakeBinnedInputPartition) partition, requiredSchema, fullSchema);
         }
         DuckLakeInputPartition dlPartition = (DuckLakeInputPartition) partition;
         return new DuckLakePartitionReader(dlPartition, requiredSchema, fullSchema);
