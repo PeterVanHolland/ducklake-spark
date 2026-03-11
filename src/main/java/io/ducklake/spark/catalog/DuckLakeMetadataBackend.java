@@ -29,7 +29,7 @@ public class DuckLakeMetadataBackend implements AutoCloseable {
         return connection;
     }
 
-    /** Expose the underlying connection for inline data operations. */
+    /** Expose the underlying connection for view/tag/inline operations. */
     public Connection getConnectionForInlining() throws SQLException {
         return getConnection();
     }
