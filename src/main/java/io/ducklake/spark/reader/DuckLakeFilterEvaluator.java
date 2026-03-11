@@ -225,7 +225,7 @@ public class DuckLakeFilterEvaluator {
      *   7. Numeric string fallback (parseDouble)
      *   8. Lexicographic string comparison
      */
-    static int compareValues(Object filterValue, String statValue) {
+    public static int compareValues(Object filterValue, String statValue) {
         if (filterValue == null || statValue == null) {
             return 0; // conservative
         }
