@@ -31,6 +31,7 @@ public class DuckLakeMetadataBackend implements AutoCloseable {
     }
 
     /** Expose the underlying connection for view/tag/inline operations. */
+    /** Expose the underlying connection for view/tag/inline operations. */
     public Connection getConnectionForInlining() throws SQLException {
         return getConnection();
     }
@@ -908,6 +909,27 @@ public class DuckLakeMetadataBackend implements AutoCloseable {
                 ps.addBatch();
             }
             ps.executeBatch();
+        }
+    }
+
+    /** Insert a data file record with explicit path_is_relative flag (for add_files). */
+    public void insertDataFileAbsolute(long dataFileId, long tableId, long beginSnapshot, long fileOrder,
+                                        String path, boolean pathIsRelative, long recordCount, long fileSizeBytes,
+                                        long rowIdStart) throws SQLException {
+        try (PreparedStatement ps = getConnection().prepareStatement(
+                "INSERT INTO ducklake_data_file (data_file_id, table_id, begin_snapshot, end_snapshot, file_order, path, path_is_relative, " +
+                "file_format, record_count, file_size_bytes, footer_size, row_id_start, partition_id, encryption_key, mapping_id, partial_max) " +
+                "VALUES (?, ?, ?, NULL, ?, ?, ?, 'PARQUET', ?, ?, 0, ?, NULL, NULL, NULL, NULL)")) {
+            ps.setLong(1, dataFileId);
+            ps.setLong(2, tableId);
+            ps.setLong(3, beginSnapshot);
+            ps.setLong(4, fileOrder);
+            ps.setString(5, path);
+            ps.setInt(6, pathIsRelative ? 1 : 0);
+            ps.setLong(7, recordCount);
+            ps.setLong(8, fileSizeBytes);
+            ps.setLong(9, rowIdStart);
+            ps.executeUpdate();
         }
     }
 
