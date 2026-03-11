@@ -192,9 +192,13 @@ public class DuckLakeCatalog implements CatalogPlugin, TableCatalog, SupportsNam
                     String newType = DuckLakeTypeMapping.toDuckDBType(updateType.newDataType());
                     backend.updateColumnType(tableInfo.tableId, colName, newType);
                 } else if (change instanceof TableChange.SetProperty) {
-                    // Table properties/tags — silently ignore for now
+                    TableChange.SetProperty setProp = (TableChange.SetProperty) change;
+                    DuckLakeTagManager tagMgr = new DuckLakeTagManager(backend);
+                    tagMgr.setTableTag(tableInfo.tableId, setProp.property(), setProp.value());
                 } else if (change instanceof TableChange.RemoveProperty) {
-                    // Table properties/tags — silently ignore for now
+                    TableChange.RemoveProperty removeProp = (TableChange.RemoveProperty) change;
+                    DuckLakeTagManager tagMgr = new DuckLakeTagManager(backend);
+                    tagMgr.deleteTableTag(tableInfo.tableId, removeProp.property());
                 } else {
                     throw new UnsupportedOperationException(
                             "Unsupported ALTER TABLE change: " + change.getClass().getSimpleName());
