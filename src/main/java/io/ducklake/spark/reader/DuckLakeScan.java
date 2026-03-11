@@ -2,6 +2,7 @@ package io.ducklake.spark.reader;
 
 import io.ducklake.spark.catalog.DuckLakeMetadataBackend;
 import io.ducklake.spark.catalog.DuckLakeMetadataBackend.*;
+import io.ducklake.spark.writer.DuckLakeInlineWriter;
 
 import org.apache.spark.sql.connector.read.*;
 import org.apache.spark.sql.types.StructType;
@@ -158,6 +159,23 @@ public class DuckLakeScan implements Scan, Batch {
                         columnTypes));
             }
 
+
+            // Add inlined data partition if any exist
+            try {
+                DuckLakeInlineWriter inlineWriter = new DuckLakeInlineWriter(backend);
+                java.util.List<java.util.Map<String, String>> inlinedRows =
+                        inlineWriter.readInlinedRows(table.tableId, snapshotId);
+                if (!inlinedRows.isEmpty()) {
+                    java.util.ArrayList<java.util.Map<String, String>> serializableRows =
+                            new java.util.ArrayList<>();
+                    for (java.util.Map<String, String> row : inlinedRows) {
+                        serializableRows.add(new java.util.LinkedHashMap<>(row));
+                    }
+                    partitions.add(new DuckLakeInlinedInputPartition(serializableRows));
+                }
+            } catch (Exception inlineEx) {
+                // No inlined data or table not present - skip
+            }
             return partitions.toArray(new InputPartition[0]);
         } catch (SQLException e) {
             throw new RuntimeException("Failed to plan DuckLake scan", e);

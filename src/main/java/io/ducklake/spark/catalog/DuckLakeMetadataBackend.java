@@ -29,6 +29,11 @@ public class DuckLakeMetadataBackend implements AutoCloseable {
         return connection;
     }
 
+    /** Expose the underlying connection for inline data operations. */
+    public Connection getConnectionForInlining() throws SQLException {
+        return getConnection();
+    }
+
     @Override
     public void close() throws SQLException {
         if (connection != null && !connection.isClosed()) {
@@ -761,6 +766,12 @@ public class DuckLakeMetadataBackend implements AutoCloseable {
         }
     }
 
+
+    /** Get schema version at a specific snapshot. */
+    public long getSchemaVersion(long snapshotId) throws SQLException {
+        CatalogState state = getSnapshotInfo(snapshotId);
+        return state.schemaVersion;
+    }
     /** Get snapshot metadata. */
     public CatalogState getSnapshotInfo(long snapshotId) throws SQLException {
         try (PreparedStatement ps = getConnection().prepareStatement(
