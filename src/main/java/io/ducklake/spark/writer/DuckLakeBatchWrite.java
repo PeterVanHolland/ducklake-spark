@@ -13,10 +13,12 @@ import org.apache.spark.sql.util.CaseInsensitiveStringMap;
 import java.io.File;
 import java.sql.SQLException;
 import java.util.*;
+import java.util.ConcurrentModificationException;
 
 /**
  * Manages the lifecycle of a batch write operation to a DuckLake table.
  * Creates writer factories for executors and commits file metadata to the catalog.
+ * Implements optimistic concurrency control to prevent conflicting concurrent writes.
  */
 public class DuckLakeBatchWrite implements Write, BatchWrite, RequiresDistributionAndOrdering {
 
@@ -29,6 +31,7 @@ public class DuckLakeBatchWrite implements Write, BatchWrite, RequiresDistributi
     private final long[] columnIds;
     private final boolean isOverwrite;
     private final List<DuckLakeMetadataBackend.PartitionInfo> partitionInfos;
+    private final long startingSnapshotId;
 
     public DuckLakeBatchWrite(CaseInsensitiveStringMap options, StructType schema,
                                TableInfo tableInfo, List<ColumnInfo> columns,
@@ -51,6 +54,13 @@ public class DuckLakeBatchWrite implements Write, BatchWrite, RequiresDistributi
         this.columnIds = columnIds;
         this.isOverwrite = isOverwrite;
         this.partitionInfos = partitionInfos;
+
+        // Capture starting snapshot ID for optimistic concurrency control
+        try (DuckLakeMetadataBackend backend = createBackend()) {
+            this.startingSnapshotId = backend.getCurrentSnapshotId();
+        } catch (SQLException e) {
+            throw new RuntimeException("Failed to get starting snapshot ID for OCC", e);
+        }
     }
 
     @Override
@@ -115,18 +125,49 @@ public class DuckLakeBatchWrite implements Write, BatchWrite, RequiresDistributi
             return;
         }
 
+        // Get max retry count from options (default 3)
+        int maxRetries = Integer.parseInt(options.getOrDefault("occ.maxRetries", "3"));
+        int retryCount = 0;
+
+        while (retryCount <= maxRetries) {
+            try {
+                commitWithOCC(validMessages);
+                return; // Success
+            } catch (ConcurrentModificationException e) {
+                retryCount++;
+                if (retryCount > maxRetries) {
+                    throw new RuntimeException("Failed to commit after " + maxRetries +
+                            " retries due to concurrent modifications. Table: " + tableInfo.name, e);
+                }
+
+                // Brief pause before retry (exponential backoff)
+                try {
+                    Thread.sleep(100L * (1L << Math.min(retryCount - 1, 4))); // 100ms, 200ms, 400ms, 800ms, 1600ms max
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    throw new RuntimeException("Write interrupted during retry", ie);
+                }
+            }
+        }
+    }
+
+    /**
+     * Performs the actual commit with optimistic concurrency control.
+     * Throws ConcurrentModificationException if a conflict is detected.
+     */
+    private void commitWithOCC(List<DuckLakeWriterCommitMessage> validMessages)
+            throws ConcurrentModificationException {
         try (DuckLakeMetadataBackend backend = createBackend()) {
             backend.beginTransaction();
             try {
-                long currentSnap = backend.getCurrentSnapshotId();
-                CatalogState snapInfo = backend.getSnapshotInfo(currentSnap);
+                CatalogState snapInfo = backend.getSnapshotInfo(startingSnapshotId);
 
-                long newSnap = currentSnap + 1;
+                long newSnap = startingSnapshotId + 1;
                 long nextFileId = snapInfo.nextFileId;
                 long newNextFileId = nextFileId + validMessages.size();
 
-                // Create new snapshot
-                backend.createSnapshot(newSnap, snapInfo.schemaVersion,
+                // Create new snapshot atomically with OCC
+                backend.createSnapshotAtomically(startingSnapshotId, newSnap, snapInfo.schemaVersion,
                         snapInfo.nextCatalogId, newNextFileId);
 
                 // If overwrite, mark existing files as deleted
