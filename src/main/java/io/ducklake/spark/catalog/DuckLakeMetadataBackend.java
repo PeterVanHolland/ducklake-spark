@@ -399,6 +399,83 @@ public class DuckLakeMetadataBackend implements AutoCloseable {
         return result;
     }
 
+    /** Get data files added between snapshots (for CDC). */
+    public List<DataFileInfo> getDataFilesInRange(long tableId, long fromSnapshotExclusive, long toSnapshotInclusive) throws SQLException {
+        List<DataFileInfo> result = new ArrayList<>();
+        try (PreparedStatement ps = getConnection().prepareStatement(
+                "SELECT data_file_id, path, path_is_relative, file_format, " +
+                "record_count, file_size_bytes, mapping_id, partition_id, begin_snapshot " +
+                "FROM ducklake_data_file " +
+                "WHERE table_id = ? AND begin_snapshot > ? AND begin_snapshot <= ? " +
+                "ORDER BY begin_snapshot, file_order")) {
+            ps.setLong(1, tableId);
+            ps.setLong(2, fromSnapshotExclusive);
+            ps.setLong(3, toSnapshotInclusive);
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    result.add(new DataFileInfo(
+                            rs.getLong("data_file_id"),
+                            rs.getString("path"),
+                            rs.getInt("path_is_relative") == 1,
+                            rs.getString("file_format"),
+                            rs.getLong("record_count"),
+                            rs.getLong("file_size_bytes"),
+                            rs.getObject("mapping_id") == null ? -1 : rs.getLong("mapping_id"),
+                            rs.getObject("partition_id") == null ? -1 : rs.getLong("partition_id"),
+                            rs.getLong("begin_snapshot")));
+                }
+            }
+        }
+        return result;
+    }
+
+    /** Get delete files added between snapshots (for CDC). */
+    public List<DeleteFileInfo> getDeleteFilesInRange(long tableId, long fromSnapshotExclusive, long toSnapshotInclusive) throws SQLException {
+        List<DeleteFileInfo> result = new ArrayList<>();
+        try (PreparedStatement ps = getConnection().prepareStatement(
+                "SELECT delete_file_id, data_file_id, path, path_is_relative, format, delete_count, begin_snapshot " +
+                "FROM ducklake_delete_file " +
+                "WHERE table_id = ? AND begin_snapshot > ? AND begin_snapshot <= ? " +
+                "ORDER BY begin_snapshot")) {
+            ps.setLong(1, tableId);
+            ps.setLong(2, fromSnapshotExclusive);
+            ps.setLong(3, toSnapshotInclusive);
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    result.add(new DeleteFileInfo(
+                            rs.getLong("delete_file_id"),
+                            rs.getLong("data_file_id"),
+                            rs.getString("path"),
+                            rs.getInt("path_is_relative") == 1,
+                            rs.getString("format"),
+                            rs.getLong("delete_count"),
+                            rs.getLong("begin_snapshot")));
+                }
+            }
+        }
+        return result;
+    }
+
+    /** Get a single data file by its ID. */
+    public DataFileInfo getDataFileById(long dataFileId) throws SQLException {
+        try (PreparedStatement ps = getConnection().prepareStatement(
+                "SELECT data_file_id, path, path_is_relative, file_format, record_count, " +
+                "file_size_bytes, COALESCE(mapping_id, -1), COALESCE(partition_id, -1), " +
+                "begin_snapshot, COALESCE(row_id_start, 0) " +
+                "FROM ducklake_data_file WHERE data_file_id = ?")) {
+            ps.setLong(1, dataFileId);
+            try (ResultSet rs = ps.executeQuery()) {
+                if (rs.next()) {
+                    return new DataFileInfo(
+                            rs.getLong(1), rs.getString(2), rs.getInt(3) == 1,
+                            rs.getString(4), rs.getLong(5), rs.getLong(6),
+                            rs.getLong(7), rs.getLong(8), rs.getLong(9), rs.getLong(10));
+                }
+                return null;
+            }
+        }
+    }
+
     // ---------------------------------------------------------------
     // Statistics queries
     // ---------------------------------------------------------------
@@ -1511,10 +1588,24 @@ public class DuckLakeMetadataBackend implements AutoCloseable {
         public final long fileSizeBytes;
         public final long mappingId;
         public final long partitionId;
+        public final long beginSnapshot;
+        public final long rowIdStart;
 
         public DataFileInfo(long dataFileId, String path, boolean pathIsRelative,
                             String format, long recordCount, long fileSizeBytes,
                             long mappingId, long partitionId) {
+            this(dataFileId, path, pathIsRelative, format, recordCount, fileSizeBytes, mappingId, partitionId, -1L, 0L);
+        }
+
+        public DataFileInfo(long dataFileId, String path, boolean pathIsRelative,
+                            String format, long recordCount, long fileSizeBytes,
+                            long mappingId, long partitionId, long beginSnapshot) {
+            this(dataFileId, path, pathIsRelative, format, recordCount, fileSizeBytes, mappingId, partitionId, beginSnapshot, 0L);
+        }
+
+        public DataFileInfo(long dataFileId, String path, boolean pathIsRelative,
+                            String format, long recordCount, long fileSizeBytes,
+                            long mappingId, long partitionId, long beginSnapshot, long rowIdStart) {
             this.dataFileId = dataFileId;
             this.path = path;
             this.pathIsRelative = pathIsRelative;
@@ -1523,23 +1614,39 @@ public class DuckLakeMetadataBackend implements AutoCloseable {
             this.fileSizeBytes = fileSizeBytes;
             this.mappingId = mappingId;
             this.partitionId = partitionId;
+            this.beginSnapshot = beginSnapshot;
+            this.rowIdStart = rowIdStart;
         }
     }
 
     public static class DeleteFileInfo {
         public final long deleteFileId;
+        public final long dataFileId;
         public final String path;
         public final boolean pathIsRelative;
         public final String format;
         public final long deleteCount;
+        public final long beginSnapshot;
 
         public DeleteFileInfo(long deleteFileId, String path, boolean pathIsRelative,
                               String format, long deleteCount) {
+            this(deleteFileId, -1, path, pathIsRelative, format, deleteCount, -1L);
+        }
+
+        public DeleteFileInfo(long deleteFileId, String path, boolean pathIsRelative,
+                              String format, long deleteCount, long beginSnapshot) {
+            this(deleteFileId, -1, path, pathIsRelative, format, deleteCount, beginSnapshot);
+        }
+
+        public DeleteFileInfo(long deleteFileId, long dataFileId, String path, boolean pathIsRelative,
+                              String format, long deleteCount, long beginSnapshot) {
             this.deleteFileId = deleteFileId;
+            this.dataFileId = dataFileId;
             this.path = path;
             this.pathIsRelative = pathIsRelative;
             this.format = format;
             this.deleteCount = deleteCount;
+            this.beginSnapshot = beginSnapshot;
         }
     }
 
