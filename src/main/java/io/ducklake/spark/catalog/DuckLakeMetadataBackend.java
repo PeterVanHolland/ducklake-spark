@@ -2060,7 +2060,7 @@ public class DuckLakeMetadataBackend implements AutoCloseable {
                             rs.getLong("delete_file_id"),
                             dataFileId,
                             rs.getString("path"),
-                            rs.getInt("path_is_relative") == 1,
+                            getBooleanCompat(rs, "path_is_relative"),
                             rs.getString("format"),
                             rs.getLong("delete_count"),
                             -1L));
