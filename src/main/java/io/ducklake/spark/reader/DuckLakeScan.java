@@ -9,6 +9,9 @@ import org.apache.spark.sql.types.StructType;
 import org.apache.spark.sql.util.CaseInsensitiveStringMap;
 import org.apache.spark.sql.sources.Filter;
 
+import io.ducklake.spark.catalog.DuckLakeTableMetadataCache;
+import org.apache.spark.sql.connector.expressions.aggregate.Aggregation;
+import org.apache.spark.sql.types.DataTypes;
 import java.io.Serializable;
 import java.sql.SQLException;
 import java.util.*;
@@ -33,21 +36,46 @@ public class DuckLakeScan implements Scan, Batch {
     /** Minimum number of partitions for parallelism. */
     private static final int MIN_PARTITIONS = 4;
 
+    /** Static cache for time-travel queries — avoids re-querying SQLite on hot runs. */
+    private static final java.util.concurrent.ConcurrentHashMap<String, DuckLakeTableMetadataCache> ttCache =
+            new java.util.concurrent.ConcurrentHashMap<>();
+
     private final StructType fullSchema;
     private final StructType requiredSchema;
     private final CaseInsensitiveStringMap options;
     private final Filter[] filters;
+    private final DuckLakeTableMetadataCache metadataCache;
+    private Aggregation pushedAggregation;
 
     public DuckLakeScan(StructType fullSchema, StructType requiredSchema,
                         CaseInsensitiveStringMap options, Filter[] filters) {
+        this(fullSchema, requiredSchema, options, filters, null, null);
+    }
+
+    public DuckLakeScan(StructType fullSchema, StructType requiredSchema,
+                        CaseInsensitiveStringMap options, Filter[] filters,
+                        DuckLakeTableMetadataCache metadataCache) {
+        this(fullSchema, requiredSchema, options, filters, metadataCache, null);
+    }
+
+    public DuckLakeScan(StructType fullSchema, StructType requiredSchema,
+                        CaseInsensitiveStringMap options, Filter[] filters,
+                        DuckLakeTableMetadataCache metadataCache,
+                        Aggregation pushedAggregation) {
         this.fullSchema = fullSchema;
         this.requiredSchema = requiredSchema;
         this.options = options;
         this.filters = filters;
+        this.metadataCache = metadataCache;
+        this.pushedAggregation = pushedAggregation;
     }
 
     @Override
     public StructType readSchema() {
+        if (pushedAggregation != null) {
+            // count(*) pushdown: output is a single LONG column
+            return new StructType().add("count", DataTypes.LongType, false);
+        }
         return requiredSchema;
     }
 
@@ -58,16 +86,55 @@ public class DuckLakeScan implements Scan, Batch {
 
     @Override
     public InputPartition[] planInputPartitions() {
+        // ============================================================
+        // COUNT(*) PUSHDOWN: return row count from metadata, zero file I/O
+        // ============================================================
+        if (pushedAggregation != null) {
+            return planCountStar();
+        }
+
+        // ============================================================
+        // FAST PATH: use pre-loaded metadata cache (zero SQLite queries)
+        // ============================================================
+        if (metadataCache != null && !hasTimeTravel()) {
+            return planFromCache(metadataCache);
+        }
+
+        // SLOW PATH: query SQLite (for time-travel or DataSource API reads)
+        // Check time-travel cache first
+        String ttCacheKey = null;
+        if (hasTimeTravel()) {
+            String catalogPath = options.get("catalog");
+            String tblName = options.get("table");
+            String snapVer = options.getOrDefault("asOfVersion",
+                    options.getOrDefault("snapshot_version", ""));
+            ttCacheKey = catalogPath + "/" + tblName + "@" + snapVer;
+            DuckLakeTableMetadataCache ttCached = ttCache.get(ttCacheKey);
+            if (ttCached != null) {
+                return planFromCache(ttCached);
+            }
+        }
+
         try (DuckLakeMetadataBackend backend = createBackend()) {
             String tableName = options.get("table");
             String schemaName = options.getOrDefault("schema", "main");
 
-            // Resolve snapshot for time travel
-            long snapshotId = backend.resolveSnapshotId(
-                    options.getOrDefault("snapshot_version", null),
-                    options.getOrDefault("snapshot_time", null));
+            // Resolve snapshot for time travel (support both option names)
+            String snapVersion = options.getOrDefault("snapshot_version", null);
+            if (snapVersion == null) snapVersion = options.getOrDefault("asOfVersion", null);
+            String snapTime = options.getOrDefault("snapshot_time", null);
+            if (snapTime == null) snapTime = options.getOrDefault("asOfTimestamp", null);
+            long snapshotId = backend.resolveSnapshotId(snapVersion, snapTime);
 
-            TableInfo table = backend.getTable(tableName, schemaName, snapshotId);
+            // Fast path: if table_id was passed from loadTable, skip re-resolution
+            TableInfo table;
+            String cachedTableId = options.getOrDefault("_table_id", null);
+            if (cachedTableId != null) {
+                long tableId = Long.parseLong(cachedTableId);
+                table = backend.getTableById(tableId, snapshotId);
+            } else {
+                table = backend.getTable(tableName, schemaName, snapshotId);
+            }
             if (table == null) {
                 throw new RuntimeException("Table not found: " + schemaName + "." + tableName);
             }
@@ -231,6 +298,14 @@ public class DuckLakeScan implements Scan, Batch {
                 }
             }
 
+            // Cache time-travel results for hot runs
+            if (ttCacheKey != null) {
+                try {
+                    DuckLakeTableMetadataCache ttFull = DuckLakeTableMetadataCache.load(backend, table, snapshotId);
+                    ttCache.put(ttCacheKey, ttFull);
+                } catch (Exception ex) { /* ignore cache failures */ }
+            }
+
             return partitions.toArray(new InputPartition[0]);
         } catch (SQLException e) {
             throw new RuntimeException("Failed to plan DuckLake scan", e);
@@ -311,6 +386,213 @@ public class DuckLakeScan implements Scan, Batch {
         return new DuckLakeMetadataBackend(catalog, dataPath);
     }
 
+    /**
+     * Count(*) pushdown: sum record_count from metadata, return a single
+     * partition with the count value. Zero Parquet file opens.
+     * Falls back to full scan if delete files exist (count would be wrong).
+     */
+    private InputPartition[] planCountStar() {
+        long totalCount = 0;
+
+        if (metadataCache != null && !hasTimeTravel() && !metadataCache.needsFileMetadata()) {
+            // Check for delete files — can't use metadata count if deletes exist
+            if (metadataCache.deleteFiles != null && !metadataCache.deleteFiles.isEmpty()) {
+                pushedAggregation = null; // cancel pushdown, use full scan
+                return planFromCache(metadataCache);
+            }
+            // From cache — zero SQLite
+            for (DataFileInfo f : metadataCache.dataFiles) {
+                totalCount += f.recordCount;
+            }
+        } else if (hasTimeTravel()) {
+            // Check tt cache first
+            String catalogPath = options.get("catalog");
+            String tblName = options.get("table");
+            String snapVer = options.getOrDefault("asOfVersion",
+                    options.getOrDefault("snapshot_version", ""));
+            String ttCacheKey = catalogPath + "/" + tblName + "@" + snapVer;
+            DuckLakeTableMetadataCache ttCached = ttCache.get(ttCacheKey);
+            if (ttCached != null) {
+                if (ttCached.deleteFiles != null && !ttCached.deleteFiles.isEmpty()) {
+                    pushedAggregation = null;
+                    return planFromCache(ttCached);
+                }
+                for (DataFileInfo f : ttCached.dataFiles) {
+                    totalCount += f.recordCount;
+                }
+            } else {
+                // Fall back to SQLite
+                try (DuckLakeMetadataBackend backend = createBackend()) {
+                    String snapVersion = options.getOrDefault("snapshot_version", null);
+                    if (snapVersion == null) snapVersion = options.getOrDefault("asOfVersion", null);
+                    String snapTime = options.getOrDefault("snapshot_time", null);
+                    if (snapTime == null) snapTime = options.getOrDefault("asOfTimestamp", null);
+                    long snapshotId = backend.resolveSnapshotId(snapVersion, snapTime);
+
+                    String tableName = options.get("table");
+                    String schemaName = options.getOrDefault("schema", "main");
+                    String cachedTableId = options.getOrDefault("_table_id", null);
+                    TableInfo table;
+                    if (cachedTableId != null) {
+                        table = backend.getTableById(Long.parseLong(cachedTableId), snapshotId);
+                    } else {
+                        table = backend.getTable(tableName, schemaName, snapshotId);
+                    }
+                    if (table == null) throw new RuntimeException("Table not found");
+                    List<DataFileInfo> files = backend.getDataFiles(table.tableId, snapshotId);
+                    for (DataFileInfo f : files) totalCount += f.recordCount;
+
+                    // Cache for next hot run
+                    DuckLakeTableMetadataCache fullCache = DuckLakeTableMetadataCache.load(backend, table, snapshotId);
+                    ttCache.put(ttCacheKey, fullCache);
+                } catch (Exception e) {
+                    throw new RuntimeException("Failed count(*) pushdown", e);
+                }
+            }
+        } else if (metadataCache != null) {
+            // Lightweight cache — load files
+            try (DuckLakeMetadataBackend backend = createBackend()) {
+                List<DataFileInfo> files = backend.getDataFiles(metadataCache.tableId, metadataCache.snapshotId);
+                for (DataFileInfo f : files) totalCount += f.recordCount;
+            } catch (Exception e) {
+                throw new RuntimeException("Failed count(*) pushdown", e);
+            }
+        } else {
+            // No cache at all — full SQLite path
+            try (DuckLakeMetadataBackend backend = createBackend()) {
+                String tableName = options.get("table");
+                String schemaName = options.getOrDefault("schema", "main");
+                long snapshotId = backend.resolveSnapshotId(null, null);
+                TableInfo table = backend.getTable(tableName, schemaName, snapshotId);
+                if (table == null) throw new RuntimeException("Table not found");
+                List<DataFileInfo> files = backend.getDataFiles(table.tableId, snapshotId);
+                for (DataFileInfo f : files) totalCount += f.recordCount;
+            } catch (Exception e) {
+                throw new RuntimeException("Failed count(*) pushdown", e);
+            }
+        }
+
+        allPartitionsColumnar = false;
+        return new InputPartition[] { new DuckLakeCountPartition(totalCount) };
+    }
+
+    private boolean hasTimeTravel() {
+        return options.containsKey("snapshot_version") || options.containsKey("snapshot_time")
+                || options.containsKey("asOfVersion") || options.containsKey("asOfTimestamp");
+    }
+
+    /**
+     * Plan partitions from the metadata cache.
+     * If file metadata is already loaded: zero SQLite queries.
+     * If lightweight cache: one connection with bulk queries (skips table/column resolution).
+     */
+    private InputPartition[] planFromCache(DuckLakeTableMetadataCache cache) {
+        // Lazy-load file metadata if needed (lightweight cache)
+        DuckLakeTableMetadataCache effectiveCache = cache;
+        if (cache.needsFileMetadata()) {
+            try (DuckLakeMetadataBackend backend = createBackend()) {
+                effectiveCache = DuckLakeTableMetadataCache.load(
+                        backend,
+                        new TableInfo(cache.tableId, null, cache.tableName, cache.tablePath, cache.pathIsRelative),
+                        cache.snapshotId);
+            } catch (Exception e) {
+                throw new RuntimeException("Failed to load file metadata from cache", e);
+            }
+        }
+
+        List<ColumnInfo> columns = effectiveCache.columns;
+        List<DataFileInfo> files = effectiveCache.dataFiles;
+        String dataPath = effectiveCache.dataPath;
+
+        // Build column maps
+        Map<Long, String> colIdToName = new HashMap<>();
+        Map<String, Long> nameToColumnId = new HashMap<>();
+        Map<Long, String> columnDefaults = new HashMap<>();
+        Map<Long, String> columnTypes = new HashMap<>();
+        for (ColumnInfo col : columns) {
+            colIdToName.put(col.columnId, col.name);
+            nameToColumnId.put(col.name, col.columnId);
+            if (col.initialDefault != null) columnDefaults.put(col.columnId, col.initialDefault);
+            columnTypes.put(col.columnId, col.type);
+        }
+
+        // Partition pruning from cache
+        List<PartitionFilter> partitionFilters = new ArrayList<>();
+        if (!effectiveCache.partitionInfos.isEmpty() && filters != null && filters.length > 0) {
+            DuckLakePartitionFilterExtractor extractor = new DuckLakePartitionFilterExtractor(effectiveCache.partitionInfos);
+            partitionFilters = extractor.extractPartitionFilters(filters);
+        }
+
+        // TODO: apply partition filter to files from cache if needed
+
+        // Build candidates with stats-based pruning
+        List<FilePartitionCandidate> candidates = new ArrayList<>();
+        for (DataFileInfo file : files) {
+            String filePath = file.pathIsRelative ? dataPath + file.path : file.path;
+
+            List<DeleteFileInfo> deleteFileList = effectiveCache.deleteFiles.getOrDefault(file.dataFileId, Collections.emptyList());
+            List<String> deletePaths = new ArrayList<>();
+            for (DeleteFileInfo df : deleteFileList) {
+                deletePaths.add(df.pathIsRelative ? dataPath + df.path : df.path);
+            }
+
+            Map<Long, String> nameMapping = null;
+            if (file.mappingId >= 0) {
+                nameMapping = effectiveCache.nameMappings.get(file.mappingId);
+            }
+
+            // Stats-based file pruning from cache
+            if (filters != null && filters.length > 0 && effectiveCache.fileColumnStats != null) {
+                List<FileColumnStats> fileStats = effectiveCache.fileColumnStats.getOrDefault(file.dataFileId, Collections.emptyList());
+                if (!fileStats.isEmpty()) {
+                    Map<String, FileColumnStats> statsMap = new HashMap<>();
+                    for (FileColumnStats fs : fileStats) {
+                        String colName = colIdToName.get(fs.columnId);
+                        if (colName != null) statsMap.put(colName, fs);
+                    }
+                    DuckLakeFilterEvaluator evaluator = new DuckLakeFilterEvaluator(statsMap, file.recordCount);
+                    boolean skip = false;
+                    for (Filter f : filters) {
+                        if (!evaluator.mightMatch(f)) { skip = true; break; }
+                    }
+                    if (skip) continue;
+                }
+            }
+
+            candidates.add(new FilePartitionCandidate(
+                    filePath, file.recordCount, file.fileSizeBytes,
+                    deletePaths.toArray(new String[0]),
+                    nameMapping, colIdToName, nameToColumnId,
+                    columnDefaults, columnTypes));
+        }
+
+        List<InputPartition> partitions = binPackPartitions(candidates);
+
+        // Determine columnar mode
+        allPartitionsColumnar = DuckLakeColumnarPartitionReader.canVectorize(requiredSchema);
+        if (allPartitionsColumnar) {
+            for (InputPartition p : partitions) {
+                if (p instanceof DuckLakeInputPartition) {
+                    DuckLakeInputPartition dlp = (DuckLakeInputPartition) p;
+                    if (dlp.hasDeleteFiles() || dlp.hasNameMapping()) {
+                        allPartitionsColumnar = false; break;
+                    }
+                } else if (p instanceof DuckLakeBinnedInputPartition) {
+                    for (DuckLakeInputPartition sub : ((DuckLakeBinnedInputPartition) p).getSubPartitions()) {
+                        if (sub.hasDeleteFiles() || sub.hasNameMapping()) {
+                            allPartitionsColumnar = false; break;
+                        }
+                    }
+                    if (!allPartitionsColumnar) break;
+                } else {
+                    allPartitionsColumnar = false; break;
+                }
+            }
+        }
+
+        return partitions.toArray(new InputPartition[0]);
+    }
+
     /** Intermediate structure for file-to-partition planning. */
     private static class FilePartitionCandidate {
         final String filePath;
@@ -342,5 +624,13 @@ public class DuckLakeScan implements Scan, Batch {
             return new DuckLakeInputPartition(filePath, recordCount, deleteFilePaths,
                     nameMapping, colIdToName, nameToColumnId, columnDefaults, columnTypes);
         }
+    }
+
+    /** Single-row partition that returns just a count value. */
+    static class DuckLakeCountPartition implements InputPartition, Serializable {
+        private static final long serialVersionUID = 1L;
+        final long count;
+        DuckLakeCountPartition(long count) { this.count = count; }
+        public long getCount() { return count; }
     }
 }

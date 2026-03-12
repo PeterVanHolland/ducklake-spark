@@ -25,6 +25,11 @@ public class DuckLakeMetadataBackend implements AutoCloseable {
     private final String jdbcUrl;
     private final String dataPath;
     private Connection connection;
+    private boolean ownsConnection = true;
+
+    // Connection pooling for repeated open/close on same catalog
+    private static final java.util.concurrent.ConcurrentHashMap<String, Connection> connectionPool =
+            new java.util.concurrent.ConcurrentHashMap<>();
 
     public DuckLakeMetadataBackend(String catalogPath, String dataPath) {
         if (catalogPath.startsWith("postgresql://") || catalogPath.startsWith("postgres://")
@@ -49,7 +54,15 @@ public class DuckLakeMetadataBackend implements AutoCloseable {
 
     private Connection getConnection() throws SQLException {
         if (connection == null || connection.isClosed()) {
-            connection = DriverManager.getConnection(jdbcUrl);
+            // Try to reuse a pooled connection
+            Connection pooled = connectionPool.remove(jdbcUrl);
+            if (pooled != null && !pooled.isClosed()) {
+                connection = pooled;
+                ownsConnection = true;
+            } else {
+                connection = DriverManager.getConnection(jdbcUrl);
+                ownsConnection = true;
+            }
         }
         return connection;
     }
@@ -62,8 +75,18 @@ public class DuckLakeMetadataBackend implements AutoCloseable {
 
     @Override
     public void close() throws SQLException {
+        if (connection != null && !connection.isClosed() && ownsConnection) {
+            // Return to pool instead of closing
+            connectionPool.put(jdbcUrl, connection);
+            connection = null;
+        }
+    }
+
+    /** Actually close the connection (bypass pool). */
+    public void closeForReal() throws SQLException {
         if (connection != null && !connection.isClosed()) {
             connection.close();
+            connection = null;
         }
     }
 
@@ -315,6 +338,29 @@ public class DuckLakeMetadataBackend implements AutoCloseable {
     }
 
     /** Get a table by name in a named schema at a specific snapshot. */
+    /** Get table directly by ID (skip schema/name resolution). */
+    public TableInfo getTableById(long tableId, long snapshotId) throws SQLException {
+        try (PreparedStatement ps = getConnection().prepareStatement(
+                "SELECT table_id, table_uuid, table_name, path, path_is_relative " +
+                "FROM ducklake_table WHERE table_id = ? " +
+                "AND begin_snapshot <= ? AND (end_snapshot IS NULL OR end_snapshot > ?)")) {
+            ps.setLong(1, tableId);
+            ps.setLong(2, snapshotId);
+            ps.setLong(3, snapshotId);
+            try (ResultSet rs = ps.executeQuery()) {
+                if (rs.next()) {
+                    return new TableInfo(
+                            rs.getLong("table_id"),
+                            rs.getString("table_uuid"),
+                            rs.getString("table_name"),
+                            rs.getString("path"),
+                            getBooleanCompat(rs, "path_is_relative"));
+                }
+            }
+        }
+        return null;
+    }
+
     public TableInfo getTable(String tableName, String schemaName, long snapshotId) throws SQLException {
         try (PreparedStatement ps = getConnection().prepareStatement(
                 "SELECT t.table_id, t.table_uuid, t.table_name, t.path, t.path_is_relative " +
@@ -803,6 +849,7 @@ public class DuckLakeMetadataBackend implements AutoCloseable {
     public void commitTransaction() throws SQLException {
         getConnection().commit();
         getConnection().setAutoCommit(true);
+        DuckLakeCatalog.invalidateMetadataCache();
     }
 
     /** Rollback the current transaction. */
@@ -977,6 +1024,28 @@ public class DuckLakeMetadataBackend implements AutoCloseable {
             ps.setLong(8, fileSizeBytes);
             ps.setLong(9, rowIdStart);
             ps.executeUpdate();
+        }
+    }
+
+    /** Batch insert column statistics for multiple columns of a data file. */
+    public void insertColumnStatsBatch(long dataFileId, long tableId,
+                                       List<long[]> statsData, List<String[]> statsStrings) throws SQLException {
+        try (PreparedStatement ps = getConnection().prepareStatement(
+                "INSERT INTO ducklake_file_column_stats (data_file_id, table_id, column_id, column_size_bytes, value_count, null_count, " +
+                "min_value, max_value, contains_nan, extra_stats) VALUES (?, ?, ?, NULL, ?, ?, ?, ?, NULL, NULL)")) {
+            for (int i = 0; i < statsData.size(); i++) {
+                long[] nums = statsData.get(i);
+                String[] strs = statsStrings.get(i);
+                ps.setLong(1, dataFileId);
+                ps.setLong(2, tableId);
+                ps.setLong(3, nums[0]); // columnId
+                ps.setLong(4, nums[1]); // valueCount
+                ps.setLong(5, nums[2]); // nullCount
+                if (strs[0] != null) { ps.setString(6, strs[0]); } else { ps.setNull(6, java.sql.Types.VARCHAR); }
+                if (strs[1] != null) { ps.setString(7, strs[1]); } else { ps.setNull(7, java.sql.Types.VARCHAR); }
+                ps.addBatch();
+            }
+            ps.executeBatch();
         }
     }
 
@@ -2060,7 +2129,7 @@ public class DuckLakeMetadataBackend implements AutoCloseable {
                             rs.getLong("delete_file_id"),
                             dataFileId,
                             rs.getString("path"),
-                            rs.getInt("path_is_relative") == 1,
+                            getBooleanCompat(rs, "path_is_relative"),
                             rs.getString("format"),
                             rs.getLong("delete_count"),
                             -1L));

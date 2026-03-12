@@ -41,6 +41,16 @@ public class DuckLakeCatalog implements CatalogPlugin, TableCatalog, SupportsNam
     private CaseInsensitiveStringMap options;
     private String catalogPath;
     private String dataPath;
+    /** In-memory metadata cache — mirrors Iceberg's CachingCatalog.
+     *  Key = "schema.table", value = fully-resolved metadata (files, stats, mappings).
+     *  Invalidated on any write/DDL operation. */
+    private static final java.util.concurrent.ConcurrentHashMap<String, DuckLakeTableMetadataCache> metaCache =
+            new java.util.concurrent.ConcurrentHashMap<>();
+
+    /** Invalidate all cached metadata. Called after writes/DDL. */
+    public static void invalidateMetadataCache() {
+        metaCache.clear();
+    }
 
     @Override
     public void initialize(String name, CaseInsensitiveStringMap options) {
@@ -89,7 +99,20 @@ public class DuckLakeCatalog implements CatalogPlugin, TableCatalog, SupportsNam
     public Table loadTable(Identifier ident) throws NoSuchTableException {
         String schemaName = resolveSchemaName(ident.namespace());
         String tableName = ident.name();
+        String cacheKey = schemaName + "." + tableName;
 
+        // Fast path: return from in-memory cache (zero SQLite)
+        DuckLakeTableMetadataCache cached = metaCache.get(cacheKey);
+        if (cached != null) {
+            StructType sparkSchema = DuckLakeTypeMapping.buildSchema(cached.columns);
+            TableInfo tableInfo = new TableInfo(cached.tableId, null,
+                    cached.tableName, cached.tablePath, cached.pathIsRelative);
+            return new DuckLakeCatalogTable(ident, sparkSchema, tableInfo,
+                    buildTableOptions(schemaName, tableName, cached.tableId),
+                    cached);
+        }
+
+        // Cold path: load from SQLite, populate cache
         try (DuckLakeMetadataBackend backend = createBackend()) {
             SchemaInfo schema = backend.getSchemaByName(schemaName);
             if (schema == null) {
@@ -99,9 +122,17 @@ public class DuckLakeCatalog implements CatalogPlugin, TableCatalog, SupportsNam
             if (tableInfo == null) {
                 throw new NoSuchTableException(ident);
             }
-            List<ColumnInfo> columns = backend.getColumns(tableInfo.tableId);
-            StructType sparkSchema = DuckLakeTypeMapping.buildSchema(columns);
-            return new DuckLakeCatalogTable(ident, sparkSchema, tableInfo, buildTableOptions(schemaName, tableName));
+            long snapshotId = backend.getCurrentSnapshotId();
+
+            // Full cache: table + columns + files + stats + delete files + name mappings
+            DuckLakeTableMetadataCache fullCache =
+                    DuckLakeTableMetadataCache.load(backend, tableInfo, snapshotId);
+            metaCache.put(cacheKey, fullCache);
+
+            StructType sparkSchema = DuckLakeTypeMapping.buildSchema(fullCache.columns);
+            return new DuckLakeCatalogTable(ident, sparkSchema, tableInfo,
+                    buildTableOptions(schemaName, tableName, tableInfo.tableId),
+                    fullCache);
         } catch (NoSuchTableException e) {
             throw e;
         } catch (SQLException e) {
@@ -112,6 +143,7 @@ public class DuckLakeCatalog implements CatalogPlugin, TableCatalog, SupportsNam
     @Override
     public Table createTable(Identifier ident, StructType schema, Transform[] partitions,
                              Map<String, String> properties) throws TableAlreadyExistsException, NoSuchNamespaceException {
+        metaCache.clear(); // invalidate on schema change
         String schemaName = resolveSchemaName(ident.namespace());
         String tableName = ident.name();
 
@@ -154,6 +186,7 @@ public class DuckLakeCatalog implements CatalogPlugin, TableCatalog, SupportsNam
 
     @Override
     public Table alterTable(Identifier ident, TableChange... changes) throws NoSuchTableException {
+        metaCache.clear(); // invalidate on schema change
         String schemaName = resolveSchemaName(ident.namespace());
         String tableName = ident.name();
 
@@ -223,6 +256,7 @@ public class DuckLakeCatalog implements CatalogPlugin, TableCatalog, SupportsNam
 
     @Override
     public boolean dropTable(Identifier ident) {
+        metaCache.clear(); // invalidate on schema change
         String schemaName = resolveSchemaName(ident.namespace());
         String tableName = ident.name();
 
@@ -389,6 +423,10 @@ public class DuckLakeCatalog implements CatalogPlugin, TableCatalog, SupportsNam
     }
 
     private CaseInsensitiveStringMap buildTableOptions(String schemaName, String tableName) {
+        return buildTableOptions(schemaName, tableName, -1);
+    }
+
+    private CaseInsensitiveStringMap buildTableOptions(String schemaName, String tableName, long tableId) {
         Map<String, String> opts = new HashMap<>();
         opts.put("catalog", catalogPath);
         if (dataPath != null) {
@@ -396,6 +434,7 @@ public class DuckLakeCatalog implements CatalogPlugin, TableCatalog, SupportsNam
         }
         opts.put("table", tableName);
         opts.put("schema", schemaName);
+        if (tableId >= 0) opts.put("_table_id", String.valueOf(tableId));
         for (Map.Entry<String, String> entry : options.asCaseSensitiveMap().entrySet()) {
             opts.putIfAbsent(entry.getKey(), entry.getValue());
         }
@@ -411,13 +450,21 @@ public class DuckLakeCatalog implements CatalogPlugin, TableCatalog, SupportsNam
         private final StructType schema;
         private final TableInfo tableInfo;
         private final CaseInsensitiveStringMap options;
+        private final DuckLakeTableMetadataCache metadataCache;
 
         DuckLakeCatalogTable(Identifier ident, StructType schema,
                              TableInfo tableInfo, CaseInsensitiveStringMap options) {
+            this(ident, schema, tableInfo, options, null);
+        }
+
+        DuckLakeCatalogTable(Identifier ident, StructType schema,
+                             TableInfo tableInfo, CaseInsensitiveStringMap options,
+                             DuckLakeTableMetadataCache metadataCache) {
             this.ident = ident;
             this.schema = schema;
             this.tableInfo = tableInfo;
             this.options = options;
+            this.metadataCache = metadataCache;
         }
 
         @Override
@@ -440,10 +487,11 @@ public class DuckLakeCatalog implements CatalogPlugin, TableCatalog, SupportsNam
         }
 
         @Override
+
         public ScanBuilder newScanBuilder(CaseInsensitiveStringMap scanOptions) {
             Map<String, String> merged = new HashMap<>(this.options.asCaseSensitiveMap());
             merged.putAll(scanOptions.asCaseSensitiveMap());
-            return new DuckLakeScanBuilder(schema, new CaseInsensitiveStringMap(merged));
+            return new DuckLakeScanBuilder(schema, new CaseInsensitiveStringMap(merged), metadataCache);
         }
 
         @Override

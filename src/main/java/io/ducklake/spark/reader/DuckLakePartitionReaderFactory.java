@@ -48,6 +48,9 @@ public class DuckLakePartitionReaderFactory implements PartitionReaderFactory, S
 
     @Override
     public PartitionReader<InternalRow> createReader(InputPartition partition) {
+        if (partition instanceof DuckLakeScan.DuckLakeCountPartition) {
+            return new DuckLakeCountReader((DuckLakeScan.DuckLakeCountPartition) partition);
+        }
         if (partition instanceof DuckLakeInlinedInputPartition) {
             return new DuckLakeInlinedPartitionReader(
                     (DuckLakeInlinedInputPartition) partition, requiredSchema);
@@ -58,5 +61,30 @@ public class DuckLakePartitionReaderFactory implements PartitionReaderFactory, S
         }
         DuckLakeInputPartition dlPartition = (DuckLakeInputPartition) partition;
         return new DuckLakePartitionReader(dlPartition, requiredSchema, fullSchema);
+    }
+
+    /** Single-row reader that returns the pre-computed count value. */
+    private static class DuckLakeCountReader implements PartitionReader<InternalRow> {
+        private final long count;
+        private boolean consumed = false;
+
+        DuckLakeCountReader(DuckLakeScan.DuckLakeCountPartition partition) {
+            this.count = partition.getCount();
+        }
+
+        @Override
+        public boolean next() {
+            if (!consumed) { consumed = true; return true; }
+            return false;
+        }
+
+        @Override
+        public InternalRow get() {
+            return new org.apache.spark.sql.catalyst.expressions.GenericInternalRow(
+                    new Object[] { count });
+        }
+
+        @Override
+        public void close() {}
     }
 }

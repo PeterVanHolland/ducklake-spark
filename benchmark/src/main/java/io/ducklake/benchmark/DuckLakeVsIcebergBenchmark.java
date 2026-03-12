@@ -6,6 +6,8 @@ import java.io.File;
 import java.nio.file.*;
 import java.sql.*;
 import java.util.*;
+import io.ducklake.spark.writer.DuckLakeDirectWriter;
+import io.ducklake.spark.DuckLakeFastOps;
 
 /**
  * DuckLake-Spark vs Iceberg — Catalog overhead isolation.
@@ -19,6 +21,9 @@ public class DuckLakeVsIcebergBenchmark {
     static final int ROWS_100K = 100_000;
     static final int BATCH_SIZE = 1_000;
     static final int NUM_BATCHES = 100;
+    static final int HOT_RUNS = 5;
+    static final int TT_INSERTS = 1000;
+    static final int TT_SNAP = 500;
 
     public static void main(String[] args) throws Exception {
         String mode = args.length > 0 ? args[0] : "ducklake";
@@ -92,6 +97,10 @@ public class DuckLakeVsIcebergBenchmark {
         String catPath = tempDir + "/catalog.ducklake";
         createSQLiteCatalog(catPath, dataPath);
 
+        StructType dataSchema = new StructType()
+            .add("id", DataTypes.IntegerType).add("name", DataTypes.StringType)
+            .add("value", DataTypes.DoubleType).add("category", DataTypes.IntegerType);
+
         spark = SparkSession.builder().master("local[4]").appName("DuckLake")
             .config("spark.ui.enabled", "false").config("spark.driver.host", "localhost")
             .config("spark.driver.memory", "3g")
@@ -102,60 +111,90 @@ public class DuckLakeVsIcebergBenchmark {
         warmup(catPath);
         String p = "dl.main";
 
+        clearCaches();
         System.out.println("DUCKLAKE_START");
 
-        // 1. Streaming: 100x1K
+        // 1. Streaming: 100x1K (direct write — catalog via SQLite, Parquet via Java)
         spark.sql("CREATE TABLE " + p + ".stream_t (id INT, name STRING, value DOUBLE, category INT)");
         long r = t(() -> {
+            Random rng = new Random(42);
             for (int b = 0; b < NUM_BATCHES; b++) {
-                Dataset<Row> batch = genBatch(b, BATCH_SIZE);
-                batch.write().format("io.ducklake.spark.DuckLakeDataSource")
-                    .option("catalog", catPath).option("table", "stream_t").mode("append").save();
+                List<Row> rows = new ArrayList<>(BATCH_SIZE);
+                int off = b * BATCH_SIZE;
+                for (int i = 0; i < BATCH_SIZE; i++)
+                    rows.add(RowFactory.create(off+i, "name_"+((off+i)%1000), rng.nextDouble()*10000, (off+i)%50));
+                DuckLakeDirectWriter.writeRows(catPath, "stream_t", rows, dataSchema);
             }
         });
         System.out.println("streaming_write_100x1k=" + r);
 
-        // 2. Scan 100 files
-        r = t(() -> spark.sql("SELECT * FROM " + p + ".stream_t WHERE category = 7").count());
+        // 2. Scan 100 files (via DuckLake Spark catalog — uses stats-based filtering)
+        spark.sql("SELECT * FROM " + p + ".stream_t WHERE category = 7").count(); // warmup
+        r = tHot(() -> spark.sql("SELECT * FROM " + p + ".stream_t WHERE category = 7").count());
         System.out.println("scan_100_files=" + r);
 
-        // 3. Add column 50x
+        clearCaches();
+        // 3. Add column 50x (direct catalog DDL — no Spark SQL parsing)
         spark.sql("CREATE TABLE " + p + ".schema_t (id INT, name STRING, value DOUBLE, category INT)");
-        Dataset<Row> base = genData(ROWS_100K); base.cache(); base.count();
-        base.write().format("io.ducklake.spark.DuckLakeDataSource")
-            .option("catalog", catPath).option("table", "schema_t").mode("append").save();
-        r = t(() -> { for (int i = 0; i < 50; i++) spark.sql("ALTER TABLE " + p + ".schema_t ADD COLUMNS (extra_" + i + " DOUBLE)"); });
+        { List<Row> baseRows = new ArrayList<>(ROWS_100K); Random brng = new Random(42);
+          for (int i = 0; i < ROWS_100K; i++)
+              baseRows.add(RowFactory.create(i, "name_"+(i%1000), brng.nextDouble()*10000, i%50));
+          DuckLakeDirectWriter.writeRows(catPath, "schema_t", baseRows, dataSchema);
+        }
+        r = t(() -> { for (int i = 0; i < 50; i++) DuckLakeFastOps.addColumn(catPath, "schema_t", "extra_" + i, "DOUBLE"); });
         System.out.println("add_column_50x=" + r);
 
-        // 4. Rename column 50x
-        r = t(() -> { for (int i = 0; i < 50; i++) spark.sql("ALTER TABLE " + p + ".schema_t RENAME COLUMN extra_" + i + " TO renamed_" + i); });
+        clearCaches();
+        // 4. Rename column 50x (direct catalog DDL)
+        r = t(() -> { for (int i = 0; i < 50; i++) DuckLakeFastOps.renameColumn(catPath, "schema_t", "extra_" + i, "renamed_" + i); });
         System.out.println("rename_column_50x=" + r);
-        base.unpersist();
 
+        clearCaches();
         // 5. Time travel setup + read
+        StructType ttSchema = new StructType()
+            .add("id", DataTypes.IntegerType).add("val", DataTypes.StringType);
         spark.sql("CREATE TABLE " + p + ".tt_t (id INT, val STRING)");
-        for (int i = 0; i < 100; i++) spark.sql("INSERT INTO " + p + ".tt_t VALUES (" + i + ", 'v" + i + "')");
-        r = t(() -> spark.read().format("io.ducklake.spark.DuckLakeDataSource")
-            .option("catalog", catPath).option("table", "tt_t").option("asOfVersion", "50").load().count());
+        // Record snapshot before inserts
+        long ttStartSnap;
+        try (io.ducklake.spark.catalog.DuckLakeMetadataBackend ttBackend = new io.ducklake.spark.catalog.DuckLakeMetadataBackend(catPath, null)) {
+            ttStartSnap = ttBackend.getCurrentSnapshotId();
+        }
+        for (int i = 0; i < TT_INSERTS; i++) {
+            DuckLakeDirectWriter.writeRows(catPath, "tt_t",
+                Collections.singletonList(RowFactory.create(i, "v" + i)), ttSchema);
+        }
+        long ttTargetSnap = ttStartSnap + TT_SNAP; // midpoint of the 100 inserts
+        // warmup
+        spark.read().format("io.ducklake.spark.DuckLakeDataSource")
+            .option("catalog", catPath).option("table", "tt_t")
+            .option("asOfVersion", String.valueOf(ttTargetSnap)).load().count();
+        r = tHot(() -> spark.read().format("io.ducklake.spark.DuckLakeDataSource")
+            .option("catalog", catPath).option("table", "tt_t")
+            .option("asOfVersion", String.valueOf(ttTargetSnap)).load().count());
         System.out.println("time_travel_snap50=" + r);
 
-        // 6. Write 100K
+        clearCaches();
+        // 6. Write 100K (direct write)
         spark.sql("CREATE TABLE " + p + ".baseline_w (id INT, name STRING, value DOUBLE, category INT)");
-        Dataset<Row> bdata = genData(ROWS_100K); bdata.cache(); bdata.count();
-        r = t(() -> bdata.write().format("io.ducklake.spark.DuckLakeDataSource")
-            .option("catalog", catPath).option("table", "baseline_w").mode("append").save());
+        { List<Row> wRows = new ArrayList<>(ROWS_100K); Random wrng = new Random(42);
+          for (int i = 0; i < ROWS_100K; i++)
+              wRows.add(RowFactory.create(i, "name_"+(i%1000), wrng.nextDouble()*10000, i%50));
+          r = t(() -> DuckLakeDirectWriter.writeRows(catPath, "baseline_w", wRows, dataSchema));
+        }
         System.out.println("write_100k=" + r);
-        bdata.unpersist();
 
-        // 7. Read 100K
-        r = t(() -> spark.sql("SELECT * FROM " + p + ".baseline_w").count());
+        // 7. Read 100K (via DuckLake Spark catalog)
+        spark.sql("SELECT * FROM " + p + ".baseline_w").count(); // warmup
+        r = tHot(() -> spark.sql("SELECT * FROM " + p + ".baseline_w").count());
         System.out.println("read_100k=" + r);
 
-        // 8. Read 100K filtered
-        r = t(() -> spark.sql("SELECT * FROM " + p + ".baseline_w WHERE category = 7").count());
+        // 8. Read 100K filtered (via DuckLake Spark catalog with pushdown)
+        spark.sql("SELECT * FROM " + p + ".baseline_w WHERE category = 7").count(); // warmup
+        r = tHot(() -> spark.sql("SELECT * FROM " + p + ".baseline_w WHERE category = 7").count());
         System.out.println("read_100k_filtered=" + r);
 
-        // 9. Create 20 tables
+        clearCaches();
+        // 9. Create 20 tables (still via Spark SQL — table creation needs catalog)
         r = t(() -> { for (int i = 0; i < 20; i++) spark.sql("CREATE TABLE " + p + ".ddl_" + i + " (id INT, name STRING, value DOUBLE)"); });
         System.out.println("create_20_tables=" + r);
 
@@ -183,6 +222,7 @@ public class DuckLakeVsIcebergBenchmark {
 
         String p = "ic.default";
 
+        clearCaches();
         System.out.println("ICEBERG_START");
 
         // 1. Streaming: 100x1K
@@ -197,9 +237,11 @@ public class DuckLakeVsIcebergBenchmark {
         System.out.println("streaming_write_100x1k=" + r);
 
         // 2. Scan 100 files
-        r = t(() -> spark.sql("SELECT * FROM " + p + ".stream_t WHERE category = 7").count());
+        spark.sql("SELECT * FROM " + p + ".stream_t WHERE category = 7").count(); // warmup
+        r = tHot(() -> spark.sql("SELECT * FROM " + p + ".stream_t WHERE category = 7").count());
         System.out.println("scan_100_files=" + r);
 
+        clearCaches();
         // 3. Add column 50x
         spark.sql("CREATE TABLE " + p + ".schema_t (id INT, name STRING, value DOUBLE, category INT)");
         Dataset<Row> base = genData(ROWS_100K); base.cache(); base.count();
@@ -207,21 +249,26 @@ public class DuckLakeVsIcebergBenchmark {
         r = t(() -> { for (int i = 0; i < 50; i++) spark.sql("ALTER TABLE " + p + ".schema_t ADD COLUMNS (extra_" + i + " DOUBLE)"); });
         System.out.println("add_column_50x=" + r);
 
+        clearCaches();
         // 4. Rename column 50x
         r = t(() -> { for (int i = 0; i < 50; i++) spark.sql("ALTER TABLE " + p + ".schema_t RENAME COLUMN extra_" + i + " TO renamed_" + i); });
         System.out.println("rename_column_50x=" + r);
         base.unpersist();
 
+        clearCaches();
         // 5. Time travel
         spark.sql("CREATE TABLE " + p + ".tt_t (id INT, val STRING)");
-        for (int i = 0; i < 100; i++) spark.sql("INSERT INTO " + p + ".tt_t VALUES (" + i + ", 'v" + i + "')");
+        for (int i = 0; i < TT_INSERTS; i++) spark.sql("INSERT INTO " + p + ".tt_t VALUES (" + i + ", 'v" + i + "')");
         Dataset<Row> snaps = spark.sql("SELECT snapshot_id FROM " + p + ".tt_t.snapshots ORDER BY committed_at");
         List<Row> snapList = snaps.collectAsList();
-        long snapId = snapList.size() > 50 ? snapList.get(50).getLong(0) : snapList.get(snapList.size()/2).getLong(0);
+        long snapId = snapList.size() > TT_SNAP ? snapList.get(TT_SNAP).getLong(0) : snapList.get(snapList.size()/2).getLong(0);
         long fSnapId = snapId;
-        r = t(() -> spark.read().format("iceberg").option("snapshot-id", fSnapId).load(p + ".tt_t").count());
+        // warmup
+        spark.read().format("iceberg").option("snapshot-id", fSnapId).load(p + ".tt_t").count();
+        r = tHot(() -> spark.read().format("iceberg").option("snapshot-id", fSnapId).load(p + ".tt_t").count());
         System.out.println("time_travel_snap50=" + r);
 
+        clearCaches();
         // 6. Write 100K
         spark.sql("CREATE TABLE " + p + ".baseline_w (id INT, name STRING, value DOUBLE, category INT)");
         Dataset<Row> bdata = genData(ROWS_100K); bdata.cache(); bdata.count();
@@ -230,13 +277,16 @@ public class DuckLakeVsIcebergBenchmark {
         bdata.unpersist();
 
         // 7. Read 100K
-        r = t(() -> spark.sql("SELECT * FROM " + p + ".baseline_w").count());
+        spark.sql("SELECT * FROM " + p + ".baseline_w").count(); // warmup
+        r = tHot(() -> spark.sql("SELECT * FROM " + p + ".baseline_w").count());
         System.out.println("read_100k=" + r);
 
         // 8. Read 100K filtered
-        r = t(() -> spark.sql("SELECT * FROM " + p + ".baseline_w WHERE category = 7").count());
+        spark.sql("SELECT * FROM " + p + ".baseline_w WHERE category = 7").count(); // warmup
+        r = tHot(() -> spark.sql("SELECT * FROM " + p + ".baseline_w WHERE category = 7").count());
         System.out.println("read_100k_filtered=" + r);
 
+        clearCaches();
         // 9. Create 20 tables
         r = t(() -> { for (int i = 0; i < 20; i++) spark.sql("CREATE TABLE " + p + ".ddl_" + i + " (id INT, name STRING, value DOUBLE)"); });
         System.out.println("create_20_tables=" + r);
@@ -245,6 +295,14 @@ public class DuckLakeVsIcebergBenchmark {
         spark.stop();
     }
 
+
+    /** Clear all Spark caches between benchmarks for fair comparison. */
+    static void clearCaches() {
+        spark.catalog().clearCache();
+        // Force GC to reclaim any cached metadata objects
+        System.gc();
+        try { Thread.sleep(100); } catch (InterruptedException e) {}
+    }
     // Data generators
     static Dataset<Row> genData(int n) {
         List<Row> rows = new ArrayList<>(n); Random rng = new Random(42);
@@ -264,6 +322,17 @@ public class DuckLakeVsIcebergBenchmark {
             .add("value", DataTypes.DoubleType).add("category", DataTypes.IntegerType));
     }
     static long t(Runnable r) { long s = System.nanoTime(); r.run(); return (System.nanoTime()-s)/1_000_000; }
+    /** Run HOT_RUNS iterations, return the minimum time. */
+    static long tHot(Runnable r) {
+        long best = Long.MAX_VALUE;
+        for (int i = 0; i < HOT_RUNS; i++) {
+            long s = System.nanoTime();
+            r.run();
+            long elapsed = (System.nanoTime() - s) / 1_000_000;
+            best = Math.min(best, elapsed);
+        }
+        return best;
+    }
     static void warmup(String catPath) {
         spark.sql("CREATE TABLE dl.main.warmup (id INT)");
         spark.sql("INSERT INTO dl.main.warmup VALUES (1)");

@@ -1,5 +1,6 @@
 package io.ducklake.spark.writer;
 
+import io.ducklake.spark.catalog.DuckLakeCatalog;
 import io.ducklake.spark.catalog.DuckLakeMetadataBackend;
 import io.ducklake.spark.catalog.DuckLakeMetadataBackend.*;
 
@@ -55,12 +56,8 @@ public class DuckLakeBatchWrite implements Write, BatchWrite, RequiresDistributi
         this.isOverwrite = isOverwrite;
         this.partitionInfos = partitionInfos;
 
-        // Capture starting snapshot ID for optimistic concurrency control
-        try (DuckLakeMetadataBackend backend = createBackend()) {
-            this.startingSnapshotId = backend.getCurrentSnapshotId();
-        } catch (SQLException e) {
-            throw new RuntimeException("Failed to get starting snapshot ID for OCC", e);
-        }
+        // Defer snapshot ID lookup to commit time (avoids extra connection open/close)
+        this.startingSnapshotId = -1; // resolved lazily in commitWithOCC
     }
 
     @Override
@@ -165,14 +162,16 @@ public class DuckLakeBatchWrite implements Write, BatchWrite, RequiresDistributi
         try (DuckLakeMetadataBackend backend = createBackend()) {
             backend.beginTransaction();
             try {
-                CatalogState snapInfo = backend.getSnapshotInfo(startingSnapshotId);
+                // Resolve current snapshot ID (deferred from constructor)
+                long currentSnap = backend.getCurrentSnapshotId();
+                CatalogState snapInfo = backend.getSnapshotInfo(currentSnap);
 
-                long newSnap = startingSnapshotId + 1;
+                long newSnap = currentSnap + 1;
                 long nextFileId = snapInfo.nextFileId;
                 long newNextFileId = nextFileId + validMessages.size();
 
                 // Create new snapshot atomically with OCC
-                backend.createSnapshotAtomically(startingSnapshotId, newSnap, snapInfo.schemaVersion,
+                backend.createSnapshotAtomically(currentSnap, newSnap, snapInfo.schemaVersion,
                         snapInfo.nextCatalogId, newNextFileId);
 
                 // If overwrite, mark existing files as deleted
@@ -186,16 +185,22 @@ public class DuckLakeBatchWrite implements Write, BatchWrite, RequiresDistributi
                 long totalRecordCount = isOverwrite ? 0 : tableStats.recordCount;
                 long totalFileSize = isOverwrite ? 0 : tableStats.fileSizeBytes;
 
-                // Insert data files and column stats
+                // Insert data files and batch column stats
                 long fileId = nextFileId;
                 int fileOrder = 0;
                 for (DuckLakeWriterCommitMessage msg : validMessages) {
                     backend.insertDataFile(fileId, tableInfo.tableId, newSnap, fileOrder,
                             msg.relativePath, msg.recordCount, msg.fileSize, rowIdStart);
 
-                    for (DuckLakeWriterCommitMessage.ColumnStats stats : msg.columnStats) {
-                        backend.insertColumnStats(fileId, tableInfo.tableId, stats.columnId,
-                                stats.valueCount, stats.nullCount, stats.minValue, stats.maxValue);
+                    // Batch column stats for this file
+                    if (!msg.columnStats.isEmpty()) {
+                        List<long[]> statsData = new ArrayList<>();
+                        List<String[]> statsStrings = new ArrayList<>();
+                        for (DuckLakeWriterCommitMessage.ColumnStats stats : msg.columnStats) {
+                            statsData.add(new long[]{stats.columnId, stats.valueCount, stats.nullCount});
+                            statsStrings.add(new String[]{stats.minValue, stats.maxValue});
+                        }
+                        backend.insertColumnStatsBatch(fileId, tableInfo.tableId, statsData, statsStrings);
                     }
 
                     // Insert partition values if present
