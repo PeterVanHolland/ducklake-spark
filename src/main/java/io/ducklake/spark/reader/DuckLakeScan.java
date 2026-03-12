@@ -204,6 +204,33 @@ public class DuckLakeScan implements Scan, Batch {
                 // No inlined data or table not present - skip
             }
 
+            // Determine if ALL partitions support columnar reads
+            // (Spark requires uniform row/columnar mode across all partitions)
+            allPartitionsColumnar = DuckLakeColumnarPartitionReader.canVectorize(requiredSchema);
+            if (allPartitionsColumnar) {
+                for (InputPartition p : partitions) {
+                    if (p instanceof DuckLakeInputPartition) {
+                        DuckLakeInputPartition dlp = (DuckLakeInputPartition) p;
+                        if (dlp.hasDeleteFiles() || dlp.hasNameMapping()) {
+                            allPartitionsColumnar = false;
+                            break;
+                        }
+                    } else if (p instanceof DuckLakeBinnedInputPartition) {
+                        for (DuckLakeInputPartition sub : ((DuckLakeBinnedInputPartition) p).getSubPartitions()) {
+                            if (sub.hasDeleteFiles() || sub.hasNameMapping()) {
+                                allPartitionsColumnar = false;
+                                break;
+                            }
+                        }
+                        if (!allPartitionsColumnar) break;
+                    } else {
+                        // Inlined partitions don't support columnar
+                        allPartitionsColumnar = false;
+                        break;
+                    }
+                }
+            }
+
             return partitions.toArray(new InputPartition[0]);
         } catch (SQLException e) {
             throw new RuntimeException("Failed to plan DuckLake scan", e);
@@ -271,9 +298,11 @@ public class DuckLakeScan implements Scan, Batch {
         return new DuckLakeBinnedInputPartition(subPartitions);
     }
 
+    private boolean allPartitionsColumnar = false;
+
     @Override
     public PartitionReaderFactory createReaderFactory() {
-        return new DuckLakePartitionReaderFactory(requiredSchema, fullSchema);
+        return new DuckLakePartitionReaderFactory(requiredSchema, fullSchema, allPartitionsColumnar);
     }
 
     private DuckLakeMetadataBackend createBackend() {

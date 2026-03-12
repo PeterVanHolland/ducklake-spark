@@ -99,7 +99,7 @@ public class DuckLakeStreamingSource implements MicroBatchStream {
 
     @Override
     public PartitionReaderFactory createReaderFactory() {
-        return new DuckLakePartitionReaderFactory(readSchema, readSchema);
+        return new DuckLakePartitionReaderFactory(readSchema, readSchema, false);
     }
 
     @Override
