@@ -849,6 +849,7 @@ public class DuckLakeMetadataBackend implements AutoCloseable {
     public void commitTransaction() throws SQLException {
         getConnection().commit();
         getConnection().setAutoCommit(true);
+        DuckLakeCatalog.invalidateMetadataCache();
     }
 
     /** Rollback the current transaction. */

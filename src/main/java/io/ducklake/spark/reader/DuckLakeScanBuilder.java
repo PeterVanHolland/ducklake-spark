@@ -64,12 +64,18 @@ public class DuckLakeScanBuilder implements ScanBuilder, SupportsPushDownRequire
     @Override
     public boolean pushAggregation(Aggregation aggregation) {
         AggregateFunc[] funcs = aggregation.aggregateExpressions();
-        // Only push down simple count(*) with no GROUP BY
+        // Only push down simple count(*) with no GROUP BY,
+        // and only if we can verify no delete files exist (otherwise count is wrong)
         if (aggregation.groupByExpressions().length == 0 &&
                 funcs.length == 1 && funcs[0] instanceof CountStar) {
-            this.pushedAggregation = aggregation;
-            this.completePushDown = true;
-            return true;
+            // Check for delete files — can't push count if deletes exist
+            if (metadataCache != null && !metadataCache.needsFileMetadata() &&
+                    (metadataCache.deleteFiles == null || metadataCache.deleteFiles.isEmpty())) {
+                this.pushedAggregation = aggregation;
+                this.completePushDown = true;
+                return true;
+            }
+            // No cache or has deletes — fall back to full scan
         }
         return false;
     }

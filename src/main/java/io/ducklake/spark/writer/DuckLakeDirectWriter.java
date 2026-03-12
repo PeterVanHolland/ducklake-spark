@@ -1,5 +1,6 @@
 package io.ducklake.spark.writer;
 
+import io.ducklake.spark.catalog.DuckLakeCatalog;
 import io.ducklake.spark.catalog.DuckLakeMetadataBackend;
 import io.ducklake.spark.catalog.DuckLakeMetadataBackend.*;
 

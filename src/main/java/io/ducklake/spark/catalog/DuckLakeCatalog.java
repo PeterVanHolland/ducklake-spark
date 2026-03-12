@@ -44,8 +44,13 @@ public class DuckLakeCatalog implements CatalogPlugin, TableCatalog, SupportsNam
     /** In-memory metadata cache — mirrors Iceberg's CachingCatalog.
      *  Key = "schema.table", value = fully-resolved metadata (files, stats, mappings).
      *  Invalidated on any write/DDL operation. */
-    private final java.util.concurrent.ConcurrentHashMap<String, DuckLakeTableMetadataCache> metaCache =
+    private static final java.util.concurrent.ConcurrentHashMap<String, DuckLakeTableMetadataCache> metaCache =
             new java.util.concurrent.ConcurrentHashMap<>();
+
+    /** Invalidate all cached metadata. Called after writes/DDL. */
+    public static void invalidateMetadataCache() {
+        metaCache.clear();
+    }
 
     @Override
     public void initialize(String name, CaseInsensitiveStringMap options) {

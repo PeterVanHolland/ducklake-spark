@@ -45,7 +45,7 @@ public class DuckLakeScan implements Scan, Batch {
     private final CaseInsensitiveStringMap options;
     private final Filter[] filters;
     private final DuckLakeTableMetadataCache metadataCache;
-    private final Aggregation pushedAggregation;
+    private Aggregation pushedAggregation;
 
     public DuckLakeScan(StructType fullSchema, StructType requiredSchema,
                         CaseInsensitiveStringMap options, Filter[] filters) {
@@ -389,11 +389,17 @@ public class DuckLakeScan implements Scan, Batch {
     /**
      * Count(*) pushdown: sum record_count from metadata, return a single
      * partition with the count value. Zero Parquet file opens.
+     * Falls back to full scan if delete files exist (count would be wrong).
      */
     private InputPartition[] planCountStar() {
         long totalCount = 0;
 
         if (metadataCache != null && !hasTimeTravel() && !metadataCache.needsFileMetadata()) {
+            // Check for delete files — can't use metadata count if deletes exist
+            if (metadataCache.deleteFiles != null && !metadataCache.deleteFiles.isEmpty()) {
+                pushedAggregation = null; // cancel pushdown, use full scan
+                return planFromCache(metadataCache);
+            }
             // From cache — zero SQLite
             for (DataFileInfo f : metadataCache.dataFiles) {
                 totalCount += f.recordCount;
@@ -407,6 +413,10 @@ public class DuckLakeScan implements Scan, Batch {
             String ttCacheKey = catalogPath + "/" + tblName + "@" + snapVer;
             DuckLakeTableMetadataCache ttCached = ttCache.get(ttCacheKey);
             if (ttCached != null) {
+                if (ttCached.deleteFiles != null && !ttCached.deleteFiles.isEmpty()) {
+                    pushedAggregation = null;
+                    return planFromCache(ttCached);
+                }
                 for (DataFileInfo f : ttCached.dataFiles) {
                     totalCount += f.recordCount;
                 }
