@@ -102,6 +102,7 @@ public class DuckLakeVsIcebergBenchmark {
         warmup(catPath);
         String p = "dl.main";
 
+        clearCaches();
         System.out.println("DUCKLAKE_START");
 
         // 1. Streaming: 100x1K
@@ -115,10 +116,12 @@ public class DuckLakeVsIcebergBenchmark {
         });
         System.out.println("streaming_write_100x1k=" + r);
 
+        clearCaches();
         // 2. Scan 100 files
         r = t(() -> spark.sql("SELECT * FROM " + p + ".stream_t WHERE category = 7").count());
         System.out.println("scan_100_files=" + r);
 
+        clearCaches();
         // 3. Add column 50x
         spark.sql("CREATE TABLE " + p + ".schema_t (id INT, name STRING, value DOUBLE, category INT)");
         Dataset<Row> base = genData(ROWS_100K); base.cache(); base.count();
@@ -127,11 +130,13 @@ public class DuckLakeVsIcebergBenchmark {
         r = t(() -> { for (int i = 0; i < 50; i++) spark.sql("ALTER TABLE " + p + ".schema_t ADD COLUMNS (extra_" + i + " DOUBLE)"); });
         System.out.println("add_column_50x=" + r);
 
+        clearCaches();
         // 4. Rename column 50x
         r = t(() -> { for (int i = 0; i < 50; i++) spark.sql("ALTER TABLE " + p + ".schema_t RENAME COLUMN extra_" + i + " TO renamed_" + i); });
         System.out.println("rename_column_50x=" + r);
         base.unpersist();
 
+        clearCaches();
         // 5. Time travel setup + read
         spark.sql("CREATE TABLE " + p + ".tt_t (id INT, val STRING)");
         for (int i = 0; i < 100; i++) spark.sql("INSERT INTO " + p + ".tt_t VALUES (" + i + ", 'v" + i + "')");
@@ -139,6 +144,7 @@ public class DuckLakeVsIcebergBenchmark {
             .option("catalog", catPath).option("table", "tt_t").option("asOfVersion", "50").load().count());
         System.out.println("time_travel_snap50=" + r);
 
+        clearCaches();
         // 6. Write 100K
         spark.sql("CREATE TABLE " + p + ".baseline_w (id INT, name STRING, value DOUBLE, category INT)");
         Dataset<Row> bdata = genData(ROWS_100K); bdata.cache(); bdata.count();
@@ -147,14 +153,17 @@ public class DuckLakeVsIcebergBenchmark {
         System.out.println("write_100k=" + r);
         bdata.unpersist();
 
+        clearCaches();
         // 7. Read 100K
         r = t(() -> spark.sql("SELECT * FROM " + p + ".baseline_w").count());
         System.out.println("read_100k=" + r);
 
+        clearCaches();
         // 8. Read 100K filtered
         r = t(() -> spark.sql("SELECT * FROM " + p + ".baseline_w WHERE category = 7").count());
         System.out.println("read_100k_filtered=" + r);
 
+        clearCaches();
         // 9. Create 20 tables
         r = t(() -> { for (int i = 0; i < 20; i++) spark.sql("CREATE TABLE " + p + ".ddl_" + i + " (id INT, name STRING, value DOUBLE)"); });
         System.out.println("create_20_tables=" + r);
@@ -183,6 +192,7 @@ public class DuckLakeVsIcebergBenchmark {
 
         String p = "ic.default";
 
+        clearCaches();
         System.out.println("ICEBERG_START");
 
         // 1. Streaming: 100x1K
@@ -196,10 +206,12 @@ public class DuckLakeVsIcebergBenchmark {
         });
         System.out.println("streaming_write_100x1k=" + r);
 
+        clearCaches();
         // 2. Scan 100 files
         r = t(() -> spark.sql("SELECT * FROM " + p + ".stream_t WHERE category = 7").count());
         System.out.println("scan_100_files=" + r);
 
+        clearCaches();
         // 3. Add column 50x
         spark.sql("CREATE TABLE " + p + ".schema_t (id INT, name STRING, value DOUBLE, category INT)");
         Dataset<Row> base = genData(ROWS_100K); base.cache(); base.count();
@@ -207,11 +219,13 @@ public class DuckLakeVsIcebergBenchmark {
         r = t(() -> { for (int i = 0; i < 50; i++) spark.sql("ALTER TABLE " + p + ".schema_t ADD COLUMNS (extra_" + i + " DOUBLE)"); });
         System.out.println("add_column_50x=" + r);
 
+        clearCaches();
         // 4. Rename column 50x
         r = t(() -> { for (int i = 0; i < 50; i++) spark.sql("ALTER TABLE " + p + ".schema_t RENAME COLUMN extra_" + i + " TO renamed_" + i); });
         System.out.println("rename_column_50x=" + r);
         base.unpersist();
 
+        clearCaches();
         // 5. Time travel
         spark.sql("CREATE TABLE " + p + ".tt_t (id INT, val STRING)");
         for (int i = 0; i < 100; i++) spark.sql("INSERT INTO " + p + ".tt_t VALUES (" + i + ", 'v" + i + "')");
@@ -222,6 +236,7 @@ public class DuckLakeVsIcebergBenchmark {
         r = t(() -> spark.read().format("iceberg").option("snapshot-id", fSnapId).load(p + ".tt_t").count());
         System.out.println("time_travel_snap50=" + r);
 
+        clearCaches();
         // 6. Write 100K
         spark.sql("CREATE TABLE " + p + ".baseline_w (id INT, name STRING, value DOUBLE, category INT)");
         Dataset<Row> bdata = genData(ROWS_100K); bdata.cache(); bdata.count();
@@ -229,14 +244,17 @@ public class DuckLakeVsIcebergBenchmark {
         System.out.println("write_100k=" + r);
         bdata.unpersist();
 
+        clearCaches();
         // 7. Read 100K
         r = t(() -> spark.sql("SELECT * FROM " + p + ".baseline_w").count());
         System.out.println("read_100k=" + r);
 
+        clearCaches();
         // 8. Read 100K filtered
         r = t(() -> spark.sql("SELECT * FROM " + p + ".baseline_w WHERE category = 7").count());
         System.out.println("read_100k_filtered=" + r);
 
+        clearCaches();
         // 9. Create 20 tables
         r = t(() -> { for (int i = 0; i < 20; i++) spark.sql("CREATE TABLE " + p + ".ddl_" + i + " (id INT, name STRING, value DOUBLE)"); });
         System.out.println("create_20_tables=" + r);
@@ -245,6 +263,14 @@ public class DuckLakeVsIcebergBenchmark {
         spark.stop();
     }
 
+
+    /** Clear all Spark caches between benchmarks for fair comparison. */
+    static void clearCaches() {
+        spark.catalog().clearCache();
+        // Force GC to reclaim any cached metadata objects
+        System.gc();
+        try { Thread.sleep(100); } catch (InterruptedException e) {}
+    }
     // Data generators
     static Dataset<Row> genData(int n) {
         List<Row> rows = new ArrayList<>(n); Random rng = new Random(42);
