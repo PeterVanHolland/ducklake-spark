@@ -48,4 +48,14 @@ public class DuckLakeInputPartition implements InputPartition, Serializable {
     public Map<String, Long> getNameToColumnId() { return nameToColumnId; }
     public Map<Long, String> getColumnDefaults() { return columnDefaults; }
     public Map<Long, String> getColumnTypes() { return columnTypes; }
+
+    /** True if this partition has delete files that require row-by-row filtering. */
+    public boolean hasDeleteFiles() {
+        return deleteFilePaths != null && deleteFilePaths.length > 0;
+    }
+
+    /** True if this partition has a name mapping (column renames requiring row-by-row mapping). */
+    public boolean hasNameMapping() {
+        return nameMapping != null && !nameMapping.isEmpty();
+    }
 }
