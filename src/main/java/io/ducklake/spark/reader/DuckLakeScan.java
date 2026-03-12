@@ -413,12 +413,14 @@ public class DuckLakeScan implements Scan, Batch {
             String ttCacheKey = catalogPath + "/" + tblName + "@" + snapVer;
             DuckLakeTableMetadataCache ttCached = ttCache.get(ttCacheKey);
             if (ttCached != null) {
-                if (ttCached.deleteFiles != null && !ttCached.deleteFiles.isEmpty()) {
-                    pushedAggregation = null;
-                    return planFromCache(ttCached);
-                }
                 for (DataFileInfo f : ttCached.dataFiles) {
                     totalCount += f.recordCount;
+                }
+                // Subtract delete counts
+                if (ttCached.deleteFiles != null) {
+                    for (List<DeleteFileInfo> dfs : ttCached.deleteFiles.values()) {
+                        for (DeleteFileInfo df : dfs) totalCount -= df.deleteCount;
+                    }
                 }
             } else {
                 // Fall back to SQLite
@@ -442,6 +444,13 @@ public class DuckLakeScan implements Scan, Batch {
                     List<DataFileInfo> files = backend.getDataFiles(table.tableId, snapshotId);
                     for (DataFileInfo f : files) totalCount += f.recordCount;
 
+                    // Subtract delete file counts
+                    Map<Long, List<DeleteFileInfo>> delFiles =
+                            backend.getAllDeleteFilesForTable(table.tableId, snapshotId);
+                    for (List<DeleteFileInfo> dfs : delFiles.values()) {
+                        for (DeleteFileInfo df : dfs) totalCount -= df.deleteCount;
+                    }
+
                     // Cache for next hot run
                     DuckLakeTableMetadataCache fullCache = DuckLakeTableMetadataCache.load(backend, table, snapshotId);
                     ttCache.put(ttCacheKey, fullCache);
@@ -454,6 +463,11 @@ public class DuckLakeScan implements Scan, Batch {
             try (DuckLakeMetadataBackend backend = createBackend()) {
                 List<DataFileInfo> files = backend.getDataFiles(metadataCache.tableId, metadataCache.snapshotId);
                 for (DataFileInfo f : files) totalCount += f.recordCount;
+                Map<Long, List<DeleteFileInfo>> delFiles =
+                        backend.getAllDeleteFilesForTable(metadataCache.tableId, metadataCache.snapshotId);
+                for (List<DeleteFileInfo> dfs : delFiles.values()) {
+                    for (DeleteFileInfo df : dfs) totalCount -= df.deleteCount;
+                }
             } catch (Exception e) {
                 throw new RuntimeException("Failed count(*) pushdown", e);
             }
@@ -467,6 +481,11 @@ public class DuckLakeScan implements Scan, Batch {
                 if (table == null) throw new RuntimeException("Table not found");
                 List<DataFileInfo> files = backend.getDataFiles(table.tableId, snapshotId);
                 for (DataFileInfo f : files) totalCount += f.recordCount;
+                Map<Long, List<DeleteFileInfo>> delFiles =
+                        backend.getAllDeleteFilesForTable(table.tableId, snapshotId);
+                for (List<DeleteFileInfo> dfs : delFiles.values()) {
+                    for (DeleteFileInfo df : dfs) totalCount -= df.deleteCount;
+                }
             } catch (Exception e) {
                 throw new RuntimeException("Failed count(*) pushdown", e);
             }
