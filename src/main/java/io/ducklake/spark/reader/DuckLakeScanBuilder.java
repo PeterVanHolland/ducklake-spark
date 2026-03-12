@@ -68,14 +68,11 @@ public class DuckLakeScanBuilder implements ScanBuilder, SupportsPushDownRequire
         // and only if we can verify no delete files exist (otherwise count is wrong)
         if (aggregation.groupByExpressions().length == 0 &&
                 funcs.length == 1 && funcs[0] instanceof CountStar) {
-            // Check for delete files — can't push count if deletes exist
-            if (metadataCache != null && !metadataCache.needsFileMetadata() &&
-                    (metadataCache.deleteFiles == null || metadataCache.deleteFiles.isEmpty())) {
-                this.pushedAggregation = aggregation;
-                this.completePushDown = true;
-                return true;
-            }
-            // No cache or has deletes — fall back to full scan
+            // Accept count(*) pushdown — planCountStar will verify
+            // no delete files and use metadata counts (cache or SQLite)
+            this.pushedAggregation = aggregation;
+            this.completePushDown = true;
+            return true;
         }
         return false;
     }

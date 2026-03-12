@@ -22,8 +22,8 @@ public class DuckLakeVsIcebergBenchmark {
     static final int BATCH_SIZE = 1_000;
     static final int NUM_BATCHES = 100;
     static final int HOT_RUNS = 5;
-    static final int TT_INSERTS = 1000;
-    static final int TT_SNAP = 500;
+    static final int TT_INSERTS = 5000;
+    static final int TT_SNAP = 2500;
 
     public static void main(String[] args) throws Exception {
         String mode = args.length > 0 ? args[0] : "ducklake";
