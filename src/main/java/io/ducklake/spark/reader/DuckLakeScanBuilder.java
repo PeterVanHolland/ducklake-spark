@@ -8,6 +8,11 @@ import org.apache.spark.sql.types.StructType;
 import org.apache.spark.sql.util.CaseInsensitiveStringMap;
 import org.apache.spark.sql.sources.Filter;
 
+import io.ducklake.spark.catalog.DuckLakeTableMetadataCache;
+import org.apache.spark.sql.connector.expressions.aggregate.Aggregation;
+import org.apache.spark.sql.connector.expressions.aggregate.AggregateFunc;
+import org.apache.spark.sql.connector.expressions.aggregate.CountStar;
+import org.apache.spark.sql.connector.read.SupportsPushDownAggregates;
 import java.sql.SQLException;
 import java.util.*;
 
@@ -16,17 +21,26 @@ import java.util.*;
  * and filter pushdown via catalog-level file pruning.
  */
 public class DuckLakeScanBuilder implements ScanBuilder, SupportsPushDownRequiredColumns,
-        SupportsPushDownFilters {
+        SupportsPushDownFilters, SupportsPushDownAggregates {
 
     private final CaseInsensitiveStringMap options;
+    private final DuckLakeTableMetadataCache metadataCache;
     private StructType schema;
     private StructType requiredSchema;
     private Filter[] pushedFilters = new Filter[0];
+    private Aggregation pushedAggregation = null;
+    private boolean completePushDown = false;
 
     public DuckLakeScanBuilder(StructType schema, CaseInsensitiveStringMap options) {
+        this(schema, options, null);
+    }
+
+    public DuckLakeScanBuilder(StructType schema, CaseInsensitiveStringMap options,
+                                DuckLakeTableMetadataCache metadataCache) {
         this.schema = schema;
         this.requiredSchema = schema;
         this.options = options;
+        this.metadataCache = metadataCache;
     }
 
     @Override
@@ -48,7 +62,25 @@ public class DuckLakeScanBuilder implements ScanBuilder, SupportsPushDownRequire
     }
 
     @Override
+    public boolean pushAggregation(Aggregation aggregation) {
+        AggregateFunc[] funcs = aggregation.aggregateExpressions();
+        // Only push down simple count(*) with no GROUP BY
+        if (aggregation.groupByExpressions().length == 0 &&
+                funcs.length == 1 && funcs[0] instanceof CountStar) {
+            this.pushedAggregation = aggregation;
+            this.completePushDown = true;
+            return true;
+        }
+        return false;
+    }
+
+    @Override
+    public boolean supportCompletePushDown(Aggregation aggregation) {
+        return completePushDown;
+    }
+
+    @Override
     public Scan build() {
-        return new DuckLakeScan(schema, requiredSchema, options, pushedFilters);
+        return new DuckLakeScan(schema, requiredSchema, options, pushedFilters, metadataCache, pushedAggregation);
     }
 }

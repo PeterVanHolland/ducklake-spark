@@ -34,5 +34,15 @@
             <artifactId>duckdb_jdbc</artifactId>
             <version>1.4.4.0</version>
         </dependency>
+        <dependency>
+            <groupId>io.ducklake</groupId>
+            <artifactId>ducklake-spark</artifactId>
+            <version>0.1.0-SNAPSHOT</version>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.parquet</groupId>
+            <artifactId>parquet-jackson</artifactId>
+            <version>1.13.1</version>
+        </dependency>
     </dependencies>
 </project>
